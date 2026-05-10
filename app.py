@@ -1,433 +1,252 @@
-import warnings
-warnings.filterwarnings("ignore")
+"""
+app.py — Streamlit dashboard for Premium Straddle Scalping (v7.17)
+Replaces matplotlib TkAgg + FuncAnimation with Streamlit auto-refresh.
+All scoring / data-fetch logic lives in core.py — unchanged.
+"""
 
-import requests
-import pandas as pd
-import numpy as np
+import time
 import streamlit as st
+import matplotlib
+matplotlib.use("Agg")          # headless backend — no Tk needed on Streamlit Cloud
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from matplotlib.patches import FancyBboxPatch
+import pandas as pd
 
-from datetime import datetime
-from zoneinfo import ZoneInfo
-
-# =====================================================
-# CONFIG
-# =====================================================
-
-BASE_URL = "https://api.india.delta.exchange/v2"
-
-IST = ZoneInfo("Asia/Kolkata")
-
-LOOKBACK_HOURS = 12
-EMA_SPAN = 5
-
-# =====================================================
-# STREAMLIT PAGE
-# =====================================================
-
-st.set_page_config(
-    page_title="BTC Premium Scanner",
-    layout="wide"
+from core import (
+    full_refresh,
+    COLORS,
+    EMA_SPAN,
+    expiry_label,
 )
 
-st.title("BTC Premium Straddle Scanner")
+# ══════════════════════════════════════════
+# PAGE CONFIG
+# ══════════════════════════════════════════
+st.set_page_config(
+    page_title="BTC Straddle Scanner",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
-# =====================================================
-# HELPERS
-# =====================================================
+# Dark theme CSS injection
+st.markdown("""
+<style>
+    body, .stApp { background-color: #0b0c10; color: #e0e0e0; }
+    .block-container { padding-top: 1rem; }
+    .metric-card {
+        background: #0f1419;
+        border: 1px solid #252e3b;
+        border-radius: 10px;
+        padding: 12px 16px;
+        text-align: center;
+    }
+    .score-badge {
+        font-size: 2rem;
+        font-weight: 800;
+    }
+    .state-label {
+        font-size: 1.1rem;
+        font-weight: 700;
+    }
+    .sublabel {
+        font-size: 0.75rem;
+        color: #888;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-def expiry_label(code):
+REFRESH_SECONDS = 300   # 5-minute refresh — matches original REFRESH_INTERVAL_MS
+_CARD_NUMS = ["①", "②", "③", "④"]
 
-    d = datetime.strptime(code, "%d%m%y")
+# ══════════════════════════════════════════
+# CHART BUILDER (matplotlib → st.pyplot)
+# ══════════════════════════════════════════
+def build_chart(exp_code: str, result: dict) -> plt.Figure:
+    df  = result["df"]
+    iv  = result["iv"]
+    cp  = df["premium"].iloc[-1]
+    ce  = df["ema5"].iloc[-1]
+    st_ = result["state"]
 
-    return f"{d.day} {d.strftime('%b %Y')}"
+    fig = plt.figure(figsize=(10, 5), facecolor=COLORS["bg"])
+    gs  = gridspec.GridSpec(2, 1, height_ratios=[5, 1], hspace=0.08, figure=fig)
+    ax  = fig.add_subplot(gs[0])
+    ax_c = fig.add_subplot(gs[1])
 
-# =====================================================
-# FETCH SPOT & TICKERS
-# =====================================================
+    ax.set_facecolor(COLORS["surface"])
+    ax_c.axis("off")
 
-def fetch_spot_and_tickers():
+    y_vals = pd.concat([df["premium"], df["ema5"]]).dropna()
+    pad    = max((y_vals.max() - y_vals.min()) * 0.20, 5)
+    ylo, yhi = y_vals.min() - pad, y_vals.max() + pad
+    ax.set_ylim(ylo, yhi)
 
-    try:
+    # ATM change lines
+    for _, sr in df[df["atm_changed"]].iterrows():
+        ax.axvline(x=sr["datetime"], color=COLORS["atm_chg"], linestyle="--", alpha=0.5)
+        ax.text(sr["datetime"], yhi, f" {int(sr['atm']):,}",
+                color=COLORS["atm_chg"], fontsize=7, rotation=90, va="top")
 
-        r = requests.get(
-            f"{BASE_URL}/tickers",
-            timeout=10,
-            verify=False
-        ).json()
+    ax.plot(df["datetime"], df["premium"],
+            color=COLORS["premium"], marker="o", markersize=4, label="Premium")
+    ax.plot(df["datetime"], df["ema5"],
+            color=COLORS["ema"], linewidth=2, label="EMA-5")
+    ax.axhline(y=cp, color=COLORS["premium"], linestyle=":", alpha=0.4)
 
-        tickers = r.get("result", [])
+    ax.yaxis.tick_right()
+    ax.yaxis.set_label_position("right")
+    ax.tick_params(colors="#888", labelsize=8)
+    for sp in ax.spines.values():
+        sp.set_color("#252e3b")
 
-        spot = float(
-            next(
-                t for t in tickers
-                if t["symbol"] == "BTCUSD"
-            )["mark_price"]
-        )
+    y_range = yhi - ylo
+    p_off, e_off = (12, -12) if cp >= ce else ((-12, 12) if abs(cp - ce) < y_range * 0.12 else (0, 0))
 
-        return spot, tickers
+    ax.annotate(f"{cp:.1f}", xy=(1, cp), xycoords=("axes fraction", "data"),
+                xytext=(6, p_off), textcoords="offset points",
+                ha="left", va="center", fontsize=9, weight="bold", color="white",
+                bbox=dict(facecolor=COLORS["premium"], edgecolor="none", pad=3),
+                annotation_clip=False)
+    ax.annotate(f"{ce:.1f}", xy=(1, ce), xycoords=("axes fraction", "data"),
+                xytext=(6, e_off), textcoords="offset points",
+                ha="left", va="center", fontsize=9, weight="bold", color="#0b0c10",
+                bbox=dict(facecolor=COLORS["ema"], edgecolor="none", pad=3),
+                annotation_clip=False)
 
-    except Exception as e:
-
-        st.error(f"Ticker Error: {e}")
-
-        return 0.0, []
-
-# =====================================================
-# AUTO FETCH EXPIRIES
-# =====================================================
-
-def active_expiries(tickers):
-
-    expiries = set()
-
-    for t in tickers:
-
-        symbol = t.get("symbol", "")
-
-        if "BTC" not in symbol:
-            continue
-
-        parts = symbol.split("-")
-
-        if len(parts) < 4:
-            continue
-
-        expiry = parts[-1]
-
-        if len(expiry) != 6:
-            continue
-
-        try:
-
-            expiry_date = datetime.strptime(
-                expiry,
-                "%d%m%y"
-            ).date()
-
-            today = datetime.now(IST).date()
-
-            if expiry_date >= today:
-
-                expiries.add(expiry)
-
-        except:
-            pass
-
-    expiries = sorted(
-        list(expiries),
-        key=lambda x: datetime.strptime(x, "%d%m%y")
+    total = result["total_score"]
+    ax.set_title(
+        f"BTC {result['label']} | Score: {total:.1f}",
+        loc="left", color="white", weight="bold", fontsize=11,
     )
+    ax.legend(fontsize=8, labelcolor="#ccc", facecolor=COLORS["surface"],
+              edgecolor="#252e3b", loc="upper left")
 
-    return expiries[:8]
+    # Score cards strip
+    _draw_score_cards(ax_c, [
+        dict(label="Premium dir", value=st_["state"],          sublabel=st_["sublabel"],         value_color=st_["color"]),
+        dict(label="IV/RV spread", value=result["iv_rv"]["value"], sublabel=result["iv_rv"]["sublabel"], value_color=result["iv_rv"]["color"]),
+        dict(label="Ratio",        value=result["ratio"]["value"],  sublabel=result["ratio"]["sublabel"],  value_color=result["ratio"]["color"]),
+        dict(label="IV Percentile",value=result["iv_pct"]["value"], sublabel=result["iv_pct"]["sublabel"], value_color=result["iv_pct"]["color"]),
+    ])
 
-# =====================================================
-# CANDLES
-# =====================================================
+    fig.tight_layout(pad=0.5)
+    return fig
 
-def candles(symbol, start, end):
+def _draw_score_cards(ax, cards):
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+    n = len(cards); pad, gap = 0.012, 0.01
+    total_w = 1.0 - 2 * pad - (n - 1) * gap
+    cw = total_w / n
+    for i, c in enumerate(cards):
+        x0 = pad + i * (cw + gap); cx = x0 + cw / 2
+        ax.add_patch(FancyBboxPatch(
+            (x0, 0.04), cw, 0.92,
+            boxstyle="round,pad=0.015",
+            facecolor=COLORS["score_bg"], edgecolor=COLORS["card_bdr"],
+            linewidth=0.8, transform=ax.transAxes, clip_on=False,
+        ))
+        ax.text(cx, 0.88, _CARD_NUMS[i],  ha="center", va="center", fontsize=8,    color="#666",             transform=ax.transAxes)
+        ax.text(cx, 0.72, c["label"],      ha="center", va="center", fontsize=7.5,  color="#999",             transform=ax.transAxes)
+        ax.text(cx, 0.46, c["value"],      ha="center", va="center", fontsize=12,   color=c["value_color"],   transform=ax.transAxes, weight="bold")
+        ax.text(cx, 0.18, c["sublabel"],   ha="center", va="center", fontsize=7,    color="#888",             transform=ax.transAxes)
 
-    try:
-
-        r = requests.get(
-            f"{BASE_URL}/history/candles",
-            params={
-                "symbol": symbol,
-                "resolution": "30m",
-                "start": start,
-                "end": end
-            },
-            timeout=10,
-            verify=False
-        ).json()
-
-        return r.get("result", [])
-
-    except:
-
-        return []
-
-# =====================================================
-# ALIGN
-# =====================================================
-
-def align(raw, col):
-
-    if not raw:
-
-        return pd.DataFrame(columns=["time", col])
-
-    df = pd.DataFrame(raw)[["time", "close"]]
-
-    df = df.rename(columns={"close": col})
-
-    df["time"] = df["time"].astype(int)
-
-    return df.drop_duplicates("time")
-
-# =====================================================
-# FETCH EXPIRY DATA
-# =====================================================
-
-def fetch_expiry_data(exp_code, spot, tickers):
-
-    now_ts = int(datetime.now().timestamp())
-
-    start = now_ts - LOOKBACK_HOURS * 3600
-
-    df_spot = align(
-        candles("BTCUSD", start, now_ts),
-        "btc_price"
+# ══════════════════════════════════════════
+# SIDEBAR
+# ══════════════════════════════════════════
+with st.sidebar:
+    st.title("⚙️ Settings")
+    refresh_interval = st.slider("Refresh interval (sec)", 60, 600, REFRESH_SECONDS, step=30)
+    st.markdown("---")
+    st.markdown("**Thresholds** (display only)")
+    st.caption("Edit `core.py` to change scoring thresholds.")
+    from core import (
+        T_IV_RV_RICH, T_RATIO_RICH, T_RATIO_AVG,
+        T_STALE_DROP_PCT, T_SPIKE_MIN_EXPANSION,
     )
-
-    if df_spot.empty:
-
-        return None
-
-    strikes = sorted({
-
-        float(t['symbol'].split('-')[2])
-
-        for t in tickers
-
-        if t['symbol'].endswith(exp_code)
-
+    st.json({
+        "IV-RV rich >":    T_IV_RV_RICH,
+        "Ratio rich >":    T_RATIO_RICH,
+        "Ratio avg >":     T_RATIO_AVG,
+        "Stale drop %":    T_STALE_DROP_PCT,
+        "Spike min exp %": T_SPIKE_MIN_EXPANSION,
     })
 
-    if not strikes:
+# ══════════════════════════════════════════
+# HEADER
+# ══════════════════════════════════════════
+st.markdown("## 📊 BTC Premium Straddle Scanner")
+st.caption("Live data · Delta Exchange India · Auto-rolls to new expiries")
 
-        return None
+status_bar = st.empty()
+refresh_btn = st.button("🔄 Refresh Now")
 
-    s_arr = np.array(strikes)
+# ══════════════════════════════════════════
+# MAIN RENDER LOOP
+# ══════════════════════════════════════════
+@st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
+def cached_refresh():
+    return full_refresh()
 
-    df_spot["atm"] = s_arr[
-        np.abs(
-            s_arr[:, None]
-            -
-            df_spot["btc_price"].to_numpy()[None, :]
-        ).argmin(axis=0)
-    ]
+def render_dashboard():
+    with st.spinner("Fetching live data from Delta Exchange..."):
+        # Use button press to bust cache
+        if refresh_btn:
+            st.cache_data.clear()
+        results = cached_refresh()
 
-    atm_map = df_spot.set_index("time")["atm"].to_dict()
+    if "error" in results:
+        st.error(f"❌ {results['error']}")
+        return
 
+    meta = results.get("__meta__", {})
+    expiries = meta.get("expiries", [])
+
+    status_bar.markdown(
+        f"**BTC Spot:** ${meta.get('spot', 0):,.0f} &nbsp;|&nbsp; "
+        f"**30d RV:** {meta.get('rv_30d', 0):.1f}% &nbsp;|&nbsp; "
+        f"**Expiries tracked:** {len(expiries)} &nbsp;|&nbsp; "
+        f"**Last refresh:** {meta.get('refreshed', '—')}"
+    )
+
+    if not expiries:
+        st.warning("No upcoming BTC option expiries found.")
+        return
+
+    # Render 2-column grid
+    exp_results = {k: v for k, v in results.items() if k != "__meta__"}
+
+    cols = st.columns(2)
+    for idx, (exp_code, result) in enumerate(exp_results.items()):
+        with cols[idx % 2]:
+            fig = build_chart(exp_code, result)
+            st.pyplot(fig, use_container_width=True)
+            plt.close(fig)
+
+    # Summary table
+    st.markdown("---")
+    st.markdown("### 📋 Summary")
     rows = []
+    for exp_code, r in exp_results.items():
+        rows.append({
+            "Expiry":     r["label"],
+            "Score":      f"{r['total_score']:.1f}",
+            "State":      r["state"]["state"],
+            "IV/RV":      r["iv_rv"]["sublabel"],
+            "Ratio":      r["ratio"]["sublabel"],
+            "IV Pct":     r["iv_pct"]["sublabel"],
+            "IV":         f"{r['iv']:.1f}%" if r["iv"] else "N/A",
+            "ATM Strike": f"{int(r['atm']):,}",
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-    for atm_s in df_spot["atm"].unique():
+render_dashboard()
 
-        call_symbol = f"MARK:C-BTC-{int(atm_s)}-{exp_code}"
-        put_symbol = f"MARK:P-BTC-{int(atm_s)}-{exp_code}"
-
-        df_c = align(
-            candles(call_symbol, start, now_ts),
-            "c"
-        )
-
-        df_p = align(
-            candles(put_symbol, start, now_ts),
-            "p"
-        )
-
-        if not df_c.empty and not df_p.empty:
-
-            merged = pd.merge(df_c, df_p, on="time")
-
-            for _, row in merged.iterrows():
-
-                if atm_map.get(row["time"]) == atm_s:
-
-                    rows.append({
-
-                        "time": row["time"],
-                        "premium": row["c"] + row["p"],
-                        "atm": atm_s
-
-                    })
-
-    if not rows:
-
-        return None
-
-    df = pd.DataFrame(rows)
-
-    df = df.sort_values("time")
-
-    df["ema5"] = df["premium"].ewm(
-        span=EMA_SPAN,
-        adjust=False
-    ).mean()
-
-    df["datetime"] = pd.to_datetime(
-        df["time"],
-        unit="s"
-    )
-
-    return df
-
-# =====================================================
-# MAIN
-# =====================================================
-
-spot, tickers = fetch_spot_and_tickers()
-
-if spot > 0:
-
-    st.metric(
-        "BTC Spot Price",
-        f"{spot:,.0f}"
-    )
-
-    expiries = active_expiries(tickers)
-
-    for exp in expiries:
-
-        st.subheader(f"Expiry: {expiry_label(exp)}")
-
-        df = fetch_expiry_data(
-            exp,
-            spot,
-            tickers
-        )
-
-        if df is None:
-
-            st.warning("No data found")
-
-            continue
-
-        fig, ax = plt.subplots(
-            figsize=(14, 5),
-            facecolor="#0b1220"
-        )
-
-        ax.set_facecolor("#0b1220")
-
-        ax.plot(
-            df["datetime"],
-            df["premium"],
-            color="#f59e0b",
-            linewidth=2,
-            marker="o",
-            markersize=6,
-            label="Premium"
-        )
-
-        ax.plot(
-            df["datetime"],
-            df["ema5"],
-            color="#00e396",
-            linewidth=2,
-            label="EMA5"
-        )
-
-        latest_premium = float(
-            df["premium"].iloc[-1]
-        )
-
-        latest_ema = float(
-            df["ema5"].iloc[-1]
-        )
-
-        ax.axhline(
-            latest_premium,
-            color="#f59e0b",
-            linestyle=":",
-            linewidth=1
-        )
-
-        difference = abs(
-            latest_premium - latest_ema
-        )
-
-        if difference < 25:
-
-            if latest_premium >= latest_ema:
-
-                premium_offset = 18
-                ema_offset = -18
-
-            else:
-
-                premium_offset = -18
-                ema_offset = 18
-
-        else:
-
-            premium_offset = 0
-            ema_offset = 0
-
-        ax.annotate(
-            f"{latest_premium:.2f}",
-            xy=(1, latest_premium),
-            xycoords=("axes fraction", "data"),
-            xytext=(12, premium_offset),
-            textcoords="offset points",
-            va="center",
-            fontsize=10,
-            fontweight="bold",
-            color="white",
-            bbox=dict(
-                facecolor="#f59e0b",
-                edgecolor="none",
-                pad=4
-            ),
-            clip_on=False
-        )
-
-        ax.annotate(
-            f"{latest_ema:.2f}",
-            xy=(1, latest_ema),
-            xycoords=("axes fraction", "data"),
-            xytext=(12, ema_offset),
-            textcoords="offset points",
-            va="center",
-            fontsize=10,
-            fontweight="bold",
-            color="white",
-            bbox=dict(
-                facecolor="#00e396",
-                edgecolor="none",
-                pad=4
-            ),
-            clip_on=False
-        )
-
-        ax.grid(
-            color="#1f2937",
-            linestyle="-",
-            linewidth=0.5,
-            alpha=0.7
-        )
-
-        ax.tick_params(
-            colors="#9ca3af",
-            labelsize=10
-        )
-
-        for spine in ax.spines.values():
-
-            spine.set_color("#1f2937")
-
-        ax.set_title(
-            f"BTC {expiry_label(exp)}",
-            color="white",
-            fontsize=14,
-            fontweight="bold",
-            loc="left"
-        )
-
-        legend = ax.legend(
-            facecolor="#111827",
-            edgecolor="#1f2937"
-        )
-
-        for text in legend.get_texts():
-
-            text.set_color("white")
-
-        ax.yaxis.tick_right()
-
-        ax.yaxis.set_label_position("right")
-
-        plt.subplots_adjust(right=0.82)
-
-        st.pyplot(fig)
+# ── Auto-refresh countdown ──────────────────
+st.markdown("---")
+countdown = st.empty()
+for remaining in range(refresh_interval, 0, -1):
+    countdown.caption(f"⏱ Next auto-refresh in {remaining}s")
+    time.sleep(1)
+st.rerun()
