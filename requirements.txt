@@ -4,3 +4,4 @@ pandas
 numpy
 matplotlib
 urllib3
+python-dotenv
