@@ -297,8 +297,13 @@ if spot > 0:
         # CURRENT VALUES
         # ==========================================
 
-        latest_premium = df["premium"].iloc[-1]
-        latest_ema = df["ema5"].iloc[-1]
+        latest_premium = float(
+            df["premium"].iloc[-1]
+        )
+
+        latest_ema = float(
+            df["ema5"].iloc[-1]
+        )
 
         # ==========================================
         # PREMIUM PRICE LINE
@@ -312,20 +317,29 @@ if spot > 0:
         )
 
         # ==========================================
-        # DYNAMIC LABEL POSITION
+        # DYNAMIC LABEL POSITIONING
         # ==========================================
 
         difference = abs(
             latest_premium - latest_ema
         )
 
-        premium_y_offset = 0
-        ema_y_offset = -18
+        if difference < 25:
 
-        if difference < 15:
+            if latest_premium >= latest_ema:
 
-            premium_y_offset = 14
-            ema_y_offset = -14
+                premium_offset = 18
+                ema_offset = -18
+
+            else:
+
+                premium_offset = -18
+                ema_offset = 18
+
+        else:
+
+            premium_offset = 0
+            ema_offset = 0
 
         # ==========================================
         # PREMIUM LABEL
@@ -335,18 +349,19 @@ if spot > 0:
             f"{latest_premium:.2f}",
             xy=(1, latest_premium),
             xycoords=("axes fraction", "data"),
-            xytext=(10, premium_y_offset),
+            xytext=(12, premium_offset),
             textcoords="offset points",
             va="center",
-            fontsize=9,
+            fontsize=10,
             fontweight="bold",
             color="white",
             bbox=dict(
                 facecolor="#f59e0b",
                 edgecolor="none",
-                pad=3
+                pad=4
             ),
-            clip_on=False
+            clip_on=False,
+            zorder=10
         )
 
         # ==========================================
@@ -357,18 +372,19 @@ if spot > 0:
             f"{latest_ema:.2f}",
             xy=(1, latest_ema),
             xycoords=("axes fraction", "data"),
-            xytext=(10, ema_y_offset),
+            xytext=(12, ema_offset),
             textcoords="offset points",
             va="center",
-            fontsize=9,
+            fontsize=10,
             fontweight="bold",
             color="white",
             bbox=dict(
                 facecolor="#00e396",
                 edgecolor="none",
-                pad=3
+                pad=4
             ),
-            clip_on=False
+            clip_on=False,
+            zorder=10
         )
 
         # ==========================================
@@ -388,7 +404,7 @@ if spot > 0:
 
         ax.tick_params(
             colors="#9ca3af",
-            labelsize=9
+            labelsize=10
         )
 
         for spine in ax.spines.values():
@@ -429,11 +445,11 @@ if spot > 0:
         ax.yaxis.set_label_position("right")
 
         # ==========================================
-        # EXTRA SPACE FOR LABELS
+        # EXTRA SPACE
         # ==========================================
 
         plt.subplots_adjust(
-            right=0.88
+            right=0.82
         )
 
         # ==========================================
