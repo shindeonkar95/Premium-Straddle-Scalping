@@ -46,10 +46,13 @@ st.title("BTC Premium Straddle Scanner")
 # =====================================================
 
 def expiry_label(code):
+
     d = datetime.strptime(code, "%d%m%y")
+
     return f"{d.day} {d.strftime('%b')}"
 
 def active_expiries():
+
     today = datetime.now(IST).date()
 
     return [
@@ -109,6 +112,7 @@ def candles(symbol, start, end):
 def align(raw, col):
 
     if not raw:
+
         return pd.DataFrame(columns=["time", col])
 
     df = pd.DataFrame(raw)[["time", "close"]]
@@ -135,6 +139,7 @@ def fetch_expiry_data(exp_code, spot, tickers):
     )
 
     if df_spot.empty:
+
         return None
 
     strikes = sorted({
@@ -148,6 +153,7 @@ def fetch_expiry_data(exp_code, spot, tickers):
     })
 
     if not strikes:
+
         return None
 
     s_arr = np.array(strikes)
@@ -196,16 +202,21 @@ def fetch_expiry_data(exp_code, spot, tickers):
                     })
 
     if not rows:
+
         return None
 
     df = pd.DataFrame(rows)
 
     df = df.sort_values("time")
 
+    # EMA
+
     df["ema5"] = df["premium"].ewm(
         span=EMA_SPAN,
         adjust=False
     ).mean()
+
+    # Datetime
 
     df["datetime"] = pd.to_datetime(
         df["time"],
@@ -246,102 +257,94 @@ if spot > 0:
             continue
 
         # ==========================================
-        # CREATE FIGURE
+        # CREATE DARK FIGURE
         # ==========================================
 
         fig, ax = plt.subplots(
-            figsize=(12, 5)
+            figsize=(14, 5),
+            facecolor="#0b1220"
         )
 
+        ax.set_facecolor("#0b1220")
+
         # ==========================================
-        # PLOT LINES
+        # PREMIUM LINE
         # ==========================================
 
         ax.plot(
             df["datetime"],
             df["premium"],
-            label="Premium",
-            linewidth=2
+            color="#f59e0b",
+            linewidth=2,
+            marker="o",
+            markersize=6,
+            label="Premium"
         )
+
+        # ==========================================
+        # EMA LINE
+        # ==========================================
 
         ax.plot(
             df["datetime"],
             df["ema5"],
-            label="EMA5",
-            linewidth=2
+            color="#00e396",
+            linewidth=2,
+            label="EMA5"
         )
 
         # ==========================================
-        # LATEST VALUES
+        # CURRENT VALUES
         # ==========================================
 
         latest_premium = df["premium"].iloc[-1]
         latest_ema = df["ema5"].iloc[-1]
 
         # ==========================================
-        # PREVENT LABEL OVERLAP
+        # PREMIUM PRICE LINE
         # ==========================================
 
-        y_range = (
-            max(
-                df["premium"].max(),
-                df["ema5"].max()
-            )
-            -
-            min(
-                df["premium"].min(),
-                df["ema5"].min()
-            )
+        ax.axhline(
+            latest_premium,
+            color="#f59e0b",
+            linestyle=":",
+            linewidth=1
         )
 
-        offset = y_range * 0.03
-
-        premium_offset = 0
-        ema_offset = 0
-
-        if abs(latest_premium - latest_ema) < offset:
-
-            premium_offset = 12
-            ema_offset = -12
-
         # ==========================================
-        # PREMIUM LABEL
+        # VALUE LABELS
         # ==========================================
 
         ax.annotate(
-            f"{latest_premium:.1f}",
+            f"{latest_premium:.2f}",
             xy=(1, latest_premium),
             xycoords=("axes fraction", "data"),
-            xytext=(8, premium_offset),
+            xytext=(10, 0),
             textcoords="offset points",
             va="center",
-            fontsize=10,
+            fontsize=9,
             fontweight="bold",
             color="white",
             bbox=dict(
-                facecolor="blue",
+                facecolor="#f59e0b",
                 edgecolor="none",
                 pad=3
             ),
             clip_on=False
         )
-
-        # ==========================================
-        # EMA LABEL
-        # ==========================================
 
         ax.annotate(
-            f"{latest_ema:.1f}",
+            f"{latest_ema:.2f}",
             xy=(1, latest_ema),
             xycoords=("axes fraction", "data"),
-            xytext=(8, ema_offset),
+            xytext=(10, -18),
             textcoords="offset points",
             va="center",
-            fontsize=10,
+            fontsize=9,
             fontweight="bold",
             color="white",
             bbox=dict(
-                facecolor="orange",
+                facecolor="#00e396",
                 edgecolor="none",
                 pad=3
             ),
@@ -349,19 +352,72 @@ if spot > 0:
         )
 
         # ==========================================
-        # STYLING
+        # GRID
         # ==========================================
 
-        ax.grid(True)
+        ax.grid(
+            color="#1f2937",
+            linestyle="-",
+            linewidth=0.5,
+            alpha=0.7
+        )
 
-        ax.legend()
+        # ==========================================
+        # AXIS COLORS
+        # ==========================================
+
+        ax.tick_params(
+            colors="#9ca3af",
+            labelsize=9
+        )
+
+        for spine in ax.spines.values():
+
+            spine.set_color("#1f2937")
+
+        # ==========================================
+        # TITLE
+        # ==========================================
 
         ax.set_title(
             f"BTC {expiry_label(exp)}",
+            color="white",
             fontsize=14,
-            fontweight="bold"
+            fontweight="bold",
+            loc="left"
         )
 
-        plt.subplots_adjust(right=0.88)
+        # ==========================================
+        # LEGEND
+        # ==========================================
+
+        legend = ax.legend(
+            facecolor="#111827",
+            edgecolor="#1f2937"
+        )
+
+        for text in legend.get_texts():
+
+            text.set_color("white")
+
+        # ==========================================
+        # RIGHT SIDE Y AXIS
+        # ==========================================
+
+        ax.yaxis.tick_right()
+
+        ax.yaxis.set_label_position("right")
+
+        # ==========================================
+        # EXTRA SPACE FOR LABELS
+        # ==========================================
+
+        plt.subplots_adjust(
+            right=0.88
+        )
+
+        # ==========================================
+        # SHOW CHART
+        # ==========================================
 
         st.pyplot(fig)
