@@ -257,7 +257,7 @@ if spot > 0:
             continue
 
         # ==========================================
-        # CREATE DARK FIGURE
+        # CREATE FIGURE
         # ==========================================
 
         fig, ax = plt.subplots(
@@ -312,14 +312,30 @@ if spot > 0:
         )
 
         # ==========================================
-        # VALUE LABELS
+        # DYNAMIC LABEL POSITION
+        # ==========================================
+
+        difference = abs(
+            latest_premium - latest_ema
+        )
+
+        premium_y_offset = 0
+        ema_y_offset = -18
+
+        if difference < 15:
+
+            premium_y_offset = 14
+            ema_y_offset = -14
+
+        # ==========================================
+        # PREMIUM LABEL
         # ==========================================
 
         ax.annotate(
             f"{latest_premium:.2f}",
             xy=(1, latest_premium),
             xycoords=("axes fraction", "data"),
-            xytext=(10, 0),
+            xytext=(10, premium_y_offset),
             textcoords="offset points",
             va="center",
             fontsize=9,
@@ -333,11 +349,15 @@ if spot > 0:
             clip_on=False
         )
 
+        # ==========================================
+        # EMA LABEL
+        # ==========================================
+
         ax.annotate(
             f"{latest_ema:.2f}",
             xy=(1, latest_ema),
             xycoords=("axes fraction", "data"),
-            xytext=(10, -18),
+            xytext=(10, ema_y_offset),
             textcoords="offset points",
             va="center",
             fontsize=9,
