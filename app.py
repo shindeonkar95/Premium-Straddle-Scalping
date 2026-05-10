@@ -21,15 +21,6 @@ IST = ZoneInfo("Asia/Kolkata")
 LOOKBACK_HOURS = 12
 EMA_SPAN = 5
 
-ALL_EXPIRIES_DDMMYY = [
-    "100526",
-    "110526",
-    "120526",
-    "150526",
-    "220526",
-    "290526"
-]
-
 # =====================================================
 # STREAMLIT PAGE
 # =====================================================
@@ -49,16 +40,11 @@ def expiry_label(code):
 
     d = datetime.strptime(code, "%d%m%y")
 
-    return f"{d.day} {d.strftime('%b')}"
+    return f"{d.day} {d.strftime('%b %Y')}"
 
-def active_expiries():
-
-    today = datetime.now(IST).date()
-
-    return [
-        c for c in ALL_EXPIRIES_DDMMYY
-        if datetime.strptime(c, "%d%m%y").date() >= today
-    ]
+# =====================================================
+# FETCH SPOT & TICKERS
+# =====================================================
 
 def fetch_spot_and_tickers():
 
@@ -87,6 +73,58 @@ def fetch_spot_and_tickers():
 
         return 0.0, []
 
+# =====================================================
+# AUTO FETCH EXPIRIES
+# =====================================================
+
+def active_expiries(tickers):
+
+    expiries = set()
+
+    for t in tickers:
+
+        symbol = t.get("symbol", "")
+
+        if "BTC" not in symbol:
+            continue
+
+        parts = symbol.split("-")
+
+        if len(parts) < 4:
+            continue
+
+        expiry = parts[-1]
+
+        if len(expiry) != 6:
+            continue
+
+        try:
+
+            expiry_date = datetime.strptime(
+                expiry,
+                "%d%m%y"
+            ).date()
+
+            today = datetime.now(IST).date()
+
+            if expiry_date >= today:
+
+                expiries.add(expiry)
+
+        except:
+            pass
+
+    expiries = sorted(
+        list(expiries),
+        key=lambda x: datetime.strptime(x, "%d%m%y")
+    )
+
+    return expiries[:8]
+
+# =====================================================
+# CANDLES
+# =====================================================
+
 def candles(symbol, start, end):
 
     try:
@@ -108,6 +146,10 @@ def candles(symbol, start, end):
     except:
 
         return []
+
+# =====================================================
+# ALIGN
+# =====================================================
 
 def align(raw, col):
 
@@ -209,14 +251,10 @@ def fetch_expiry_data(exp_code, spot, tickers):
 
     df = df.sort_values("time")
 
-    # EMA
-
     df["ema5"] = df["premium"].ewm(
         span=EMA_SPAN,
         adjust=False
     ).mean()
-
-    # Datetime
 
     df["datetime"] = pd.to_datetime(
         df["time"],
@@ -238,7 +276,7 @@ if spot > 0:
         f"{spot:,.0f}"
     )
 
-    expiries = active_expiries()
+    expiries = active_expiries(tickers)
 
     for exp in expiries:
 
@@ -256,20 +294,12 @@ if spot > 0:
 
             continue
 
-        # ==========================================
-        # CREATE FIGURE
-        # ==========================================
-
         fig, ax = plt.subplots(
             figsize=(14, 5),
             facecolor="#0b1220"
         )
 
         ax.set_facecolor("#0b1220")
-
-        # ==========================================
-        # PREMIUM LINE
-        # ==========================================
 
         ax.plot(
             df["datetime"],
@@ -281,10 +311,6 @@ if spot > 0:
             label="Premium"
         )
 
-        # ==========================================
-        # EMA LINE
-        # ==========================================
-
         ax.plot(
             df["datetime"],
             df["ema5"],
@@ -292,10 +318,6 @@ if spot > 0:
             linewidth=2,
             label="EMA5"
         )
-
-        # ==========================================
-        # CURRENT VALUES
-        # ==========================================
 
         latest_premium = float(
             df["premium"].iloc[-1]
@@ -305,20 +327,12 @@ if spot > 0:
             df["ema5"].iloc[-1]
         )
 
-        # ==========================================
-        # PREMIUM PRICE LINE
-        # ==========================================
-
         ax.axhline(
             latest_premium,
             color="#f59e0b",
             linestyle=":",
             linewidth=1
         )
-
-        # ==========================================
-        # DYNAMIC LABEL POSITIONING
-        # ==========================================
 
         difference = abs(
             latest_premium - latest_ema
@@ -341,10 +355,6 @@ if spot > 0:
             premium_offset = 0
             ema_offset = 0
 
-        # ==========================================
-        # PREMIUM LABEL
-        # ==========================================
-
         ax.annotate(
             f"{latest_premium:.2f}",
             xy=(1, latest_premium),
@@ -360,13 +370,8 @@ if spot > 0:
                 edgecolor="none",
                 pad=4
             ),
-            clip_on=False,
-            zorder=10
+            clip_on=False
         )
-
-        # ==========================================
-        # EMA LABEL
-        # ==========================================
 
         ax.annotate(
             f"{latest_ema:.2f}",
@@ -383,13 +388,8 @@ if spot > 0:
                 edgecolor="none",
                 pad=4
             ),
-            clip_on=False,
-            zorder=10
+            clip_on=False
         )
-
-        # ==========================================
-        # GRID
-        # ==========================================
 
         ax.grid(
             color="#1f2937",
@@ -397,10 +397,6 @@ if spot > 0:
             linewidth=0.5,
             alpha=0.7
         )
-
-        # ==========================================
-        # AXIS COLORS
-        # ==========================================
 
         ax.tick_params(
             colors="#9ca3af",
@@ -411,10 +407,6 @@ if spot > 0:
 
             spine.set_color("#1f2937")
 
-        # ==========================================
-        # TITLE
-        # ==========================================
-
         ax.set_title(
             f"BTC {expiry_label(exp)}",
             color="white",
@@ -422,10 +414,6 @@ if spot > 0:
             fontweight="bold",
             loc="left"
         )
-
-        # ==========================================
-        # LEGEND
-        # ==========================================
 
         legend = ax.legend(
             facecolor="#111827",
@@ -436,24 +424,10 @@ if spot > 0:
 
             text.set_color("white")
 
-        # ==========================================
-        # RIGHT SIDE Y AXIS
-        # ==========================================
-
         ax.yaxis.tick_right()
 
         ax.yaxis.set_label_position("right")
 
-        # ==========================================
-        # EXTRA SPACE
-        # ==========================================
-
-        plt.subplots_adjust(
-            right=0.82
-        )
-
-        # ==========================================
-        # SHOW CHART
-        # ==========================================
+        plt.subplots_adjust(right=0.82)
 
         st.pyplot(fig)
