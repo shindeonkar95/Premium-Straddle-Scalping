@@ -1,454 +1,311 @@
 """
 =============================================================================
-  BTC MULTI-EXPIRY STRADDLE SCANNER  —  Streamlit Edition
-  Tracks: 10-May, 11-May, 12-May, 15-May, 22-May, 29-May (rolls automatically)
-  Layout: 2-column grid, one panel per active expiry
-  Run   : streamlit run combined_scanner_v4_streamlit.py
+  Premium Straddle Scalping — v7.16 (Standalone Production Build)
 =============================================================================
 """
 import warnings
 warnings.filterwarnings("ignore", message=".*tight_layout.*", category=UserWarning)
 
-import streamlit as st
-import requests
-import pandas as pd
-import numpy as np
-import re
-import time
+print("Starting Premium Straddle Scalping (v7.16 Production Edition)...")
+import matplotlib
+matplotlib.use('TkAgg')
+
+import os, requests, pandas as pd, numpy as np, re, time, json
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+import matplotlib.gridspec as gridspec
+from matplotlib.animation import FuncAnimation
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from rich.console import Console
+from dotenv import load_dotenv
 import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+load_dotenv()
 
 # ══════════════════════════════════════════
-# 1. CONFIG
+# 1. API & PERSISTENCE CONFIG
 # ══════════════════════════════════════════
-st.set_page_config(
-    page_title="BTC Multi-Expiry Straddle Scanner",
-    layout="wide",
-    page_icon="₿",
-)
-
 BASE_URL       = "https://api.india.delta.exchange/v2"
 DELTA_CDN_BASE = "https://cdn.india.deltaex.org/v2"
 IST            = ZoneInfo("Asia/Kolkata")
+HISTORY_FILE   = "iv_history.json"
+console        = Console()
 
-REFRESH_SECONDS     = 5 * 60          # 5 min
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+REFRESH_INTERVAL_MS = 5 * 60 * 1000   
 CANDLE_SECONDS      = 30 * 60
-MAX_CANDLES         = 48              # 24 h of 30-min candles
+MAX_CANDLES         = 48               
 LOOKBACK_HOURS      = 12
+EMA_SPAN            = 5
 
-EMA_SPAN       = 5
-EMA_BUFFER     = 1.0
-MIN_DOTS_ABOVE = 3
-GO_THRESHOLD   = 7.0
-WARN_THRESHOLD = 5.0
+ALL_EXPIRIES_DDMMYY = ["100526", "110526", "120526", "150526", "220526", "290526"]
 
-TELEGRAM_TOKEN   = st.secrets["TELEGRAM_TOKEN"]
-TELEGRAM_CHAT_ID = st.secrets["TELEGRAM_CHAT_ID"]
+# --- TUNING THRESHOLDS ---
+T_STALE_DROP_PCT = 25.0       
+T_SPIKE_MIN_EXPANSION = 2.5   
+T_CONSEC_UP_SPIKING  = 3      
+T_CONSEC_DOWN_CASE_A = 3      
+T_CONSEC_DOWN_ROLLING= 2      
+T_EMA_SLOPE_CASE_A  = -0.2    
+T_EMA_SLOPE_ROLLING = 0.0     
+T_IV_RV_RICH  = 5.0           
+T_RATIO_RICH  = 2.2           
+T_RATIO_AVG   = 1.2           
+MAX_IV_HISTORY = 10000        
+SAVE_COOLDOWN_SEC = 3600      
 
-ALL_EXPIRIES_DDMMYY = [
-    "100526",   # 10-May-2026
-    "110526",   # 11-May-2026
-    "120526",   # 12-May-2026
-    "150526",   # 15-May-2026
-    "220526",   # 22-May-2026
-    "290526",   # 29-May-2026
-]
-
+# ══════════════════════════════════════════
+# 2. UI COLORS & STATE HELPERS
+# ══════════════════════════════════════════
 COLORS = {
-    "premium": "#ff9800",
-    "ema":     "#2ecc71",
-    "grid":    "#2b323b",
-    "bg":      "#0b0c10",
-    "surface": "#0f1419",
-    "go":      "#27ae60",
-    "watch":   "#f39c12",
-    "wait":    "#e74c3c",
+    "premium":  "#ff9800", "ema": "#2ecc71", "atm_chg": "#9b59b6",
+    "grid": "#2b323b", "bg": "#0b0c10", "surface": "#0f1419",
+    "go": "#27ae60", "watch": "#f39c12", "wait": "#e74c3c",
+    "score_bg": "#161d27", "card_bdr": "#252e3b",
+    "spiking": "#e74c3c", "cooling": "#e67e22", "rolling": "#f39c12",
+    "case_a": "#27ae60", "no_spike": "#e74c3c", "stale": "#7f8c8d",
 }
 
-# ══════════════════════════════════════════
-# 2. HELPERS
-# ══════════════════════════════════════════
-def active_expiries() -> list[str]:
-    """Return expiry codes that have NOT yet expired (expiry date >= today IST)."""
-    today = datetime.now(IST).date()
-    return [
-        code for code in ALL_EXPIRIES_DDMMYY
-        if datetime.strptime(code, "%d%m%y").date() >= today
-    ]
+_exp_state: dict[str, dict] = {}
+_fig_state: dict = {"expiries": [], "fig": None, "axes": {}}
+_last_save_time = 0
 
-def expiry_label(code: str) -> str:
-    """'100526' → '10 May'"""
+def load_iv_history():
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r") as f: return json.load(f)
+        except Exception as e: print(f"History Load Error: {e}")
+    return {}
+
+def save_iv_history(history_dict, force=False):
+    global _last_save_time
+    now = time.time()
+    if force or (now - _last_save_time > SAVE_COOLDOWN_SEC):
+        try:
+            with open(HISTORY_FILE, "w") as f: json.dump(history_dict, f)
+            _last_save_time = now
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] IV History saved to disk.")
+        except Exception as e: print(f"History Save Error: {e}")
+
+_persistent_history = load_iv_history()
+
+def ensure_state(exp: str):
+    if exp not in _exp_state:
+        hist = _persistent_history.get(exp, [])
+        _exp_state[exp] = dict(iv_history=hist, last_score=0.0, last_verdict="WAIT")
+
+def active_expiries():
+    today = datetime.now(IST).date()
+    return [c for c in ALL_EXPIRIES_DDMMYY if datetime.strptime(c, "%d%m%y").date() >= today]
+
+def expiry_label(code: str):
     d = datetime.strptime(code, "%d%m%y")
     return f"{d.day} {d.strftime('%b')}"
 
-def send_telegram(msg: str):
-    try:
-        requests.get(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            params={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
-            timeout=8,
-        )
-    except Exception:
-        pass
-
 # ══════════════════════════════════════════
-# 3. DATA FETCH
+# 3. SCORING & CLASSIFIER
 # ══════════════════════════════════════════
-def align_and_dedupe(raw: list, col: str) -> pd.DataFrame:
-    if not raw:
-        return pd.DataFrame(columns=["time", col])
-    df = pd.DataFrame(raw)[["time", "close"]].copy()
-    df["time"] = (df["time"].astype(int) // CANDLE_SECONDS) * CANDLE_SECONDS
-    return (
-        df.rename(columns={"close": col})
-        .drop_duplicates("time")
-        .sort_values("time")
-        .tail(MAX_CANDLES)
-        .reset_index(drop=True)
-    )
-
-def _candles(symbol: str, start: int, end: int) -> list:
-    try:
-        r = requests.get(
-            f"{BASE_URL}/history/candles",
-            params={"symbol": symbol, "resolution": "30m", "start": start, "end": end},
-            verify=False, timeout=12,
-        )
-        return r.json().get("result", [])
-    except Exception:
-        return []
-
-def fetch_spot_and_tickers() -> tuple[float, list]:
-    try:
-        res     = requests.get(f"{BASE_URL}/tickers", timeout=12, verify=False).json()
-        tickers = res.get("result", [])
-        spot    = float(next(t for t in tickers if t["symbol"] == "BTCUSD")["mark_price"])
-        return spot, tickers
-    except Exception:
-        return 0.0, []
-
-def fetch_expiry_data(exp_code: str, spot: float, tickers: list) -> dict | None:
-    """Fetch 12-h premium history for a specific BTC expiry."""
-    try:
-        opts = []
-        for t in tickers:
-            m = re.search(r'^(C|P)-BTC-(\d+)-(\d{6})$', t['symbol'].upper())
-            if m and m.group(3) == exp_code:
-                opts.append({"type": m.group(1), "strike": float(m.group(2))})
-
-        if not opts:
-            return None
-
-        strikes = sorted(set(o["strike"] for o in opts))
-        atm     = min(strikes, key=lambda x: abs(x - spot))
-
-        now_ts = int(time.time())
-        start  = now_ts - LOOKBACK_HOURS * 3600
-        end    = now_ts
-
-        ce_sym = f"C-BTC-{int(atm)}-{exp_code}"
-        pe_sym = f"P-BTC-{int(atm)}-{exp_code}"
-
-        df_c = align_and_dedupe(_candles(f"MARK:{ce_sym}", start, end), "c")
-        df_p = align_and_dedupe(_candles(f"MARK:{pe_sym}", start, end), "p")
-
-        if df_c.empty or df_p.empty:
-            return None
-
-        df = pd.merge(df_c, df_p, on="time")
-        df["premium"] = df["c"].astype(float) + df["p"].astype(float)
-        df["ema5"]    = df["premium"].ewm(span=EMA_SPAN, adjust=False).mean()
-
-        # BTC spot history for RV
-        df_spot = align_and_dedupe(_candles("BTCUSD", start, end), "btc_price")
-        df      = pd.merge(df, df_spot, on="time", how="left")
-
-        df["datetime"] = (
-            pd.to_datetime(df["time"], unit="s")
-            .dt.tz_localize("UTC")
-            .dt.tz_convert(IST)
-        )
-
-        # IV from CDN
-        iv = None
-        try:
-            iv_res = requests.get(
-                f"{DELTA_CDN_BASE}/options_iv",
-                params={
-                    "asset_symbol": "BTC", "maturity": "daily",
-                    "resolution": "30m", "start_time": start, "end_time": end,
-                },
-                verify=False, timeout=10,
-            ).json()
-            ivs = [x for x in iv_res.get("result", {}).get("atm_iv", []) if x is not None]
-            if ivs:
-                iv = float(ivs[-1])
-        except Exception:
-            pass
-
-        df["iv"] = iv
-
-        return {
-            "df": df, "atm": atm,
-            "ce_sym": ce_sym, "pe_sym": pe_sym,
-            "iv": iv, "spot": spot,
-        }
-    except Exception:
-        return None
-
-# ══════════════════════════════════════════
-# 4. SCORING
-# ══════════════════════════════════════════
-def score_premium_direction(df: pd.DataFrame):
-    if len(df) < 2:
-        return 0.0, 0, "WAIT"
-    recent     = df.tail(16)
-    dots_above = int((recent["premium"] > (recent["ema5"] + EMA_BUFFER)).sum())
-    if dots_above < MIN_DOTS_ABOVE:
-        return 0.0, dots_above, f"{dots_above} dots"
-    ratio = min((dots_above - MIN_DOTS_ABOVE) / (16 - MIN_DOTS_ABOVE), 1.0)
-    return round(ratio * 3.5, 2), dots_above, f"{dots_above}/16 above"
-
-def compute_rv(df: pd.DataFrame):
-    prices = df["btc_price"].dropna()
-    if len(prices) < 2:
-        return None
-    return round(np.log(prices / prices.shift(1)).dropna().std() * np.sqrt(48 * 365) * 100, 2)
-
 def score_iv_rv(iv, rv):
-    if iv is None or rv is None:
-        return 1.75, "N/A"
-    s = iv - rv
-    if s < -10: return 3.5, f"CHEAP Δ{s:.0f}"
-    if s <   0: return 2.5, f"CHEAP Δ{s:.0f}"
-    return 1.0, f"EXP Δ{s:.0f}"
+    if rv is None: rv = 20.0
+    if iv is None: return 1.75, "N/A", "no data", "#888"
+    spread = iv - rv
+    rel = "IV>RV" if spread >= 0 else "IV<RV"
+    delta = f"Δ {spread:+.1f}"
+    if spread > T_IV_RV_RICH: return 3.5, rel, f"RICH {delta}", COLORS["case_a"]
+    if spread >= 0: return 2.5, rel, f"FAIR {delta}", COLORS["rolling"]
+    return 1.0, rel, f"RISK {delta}", COLORS["wait"]
 
 def score_ratio(premium, spot):
-    if not premium or not spot:
-        return 0.75, "N/A"
+    if not premium or not spot: return 0.75, "N/A", "no data", "#888"
     r = (premium / spot) * 100
-    return 0.75, f"{r:.3f}%"
+    if r > T_RATIO_RICH: return 1.50, f"{r:.2f}%", "RICH", COLORS["case_a"]
+    if r > T_RATIO_AVG: return 1.00, f"{r:.2f}%", "AVG", COLORS["watch"]
+    return 0.50, f"{r:.2f}%", "CHEAP", COLORS["wait"]
 
-def score_iv_pct(iv):
-    return (0.75, f"{iv:.1f}%") if iv else (0.0, "N/A")
+def score_iv_percentile(current_iv, exp_code):
+    history = _exp_state[exp_code]["iv_history"]
+    if current_iv is None: return 0.75, "N/A", "no data", "#888"
+    if len(history) < 5:
+        res = (0.75, "N/A", "collecting...", "#888")
+    else:
+        inclusive_count = sum(1 for h_iv in history if h_iv <= current_iv)
+        ivp = (inclusive_count / len(history)) * 100
+        if ivp > 80: res = (1.50, f"{ivp:.0f}%", "HIGH", "#27ae60")
+        elif ivp > 40: res = (1.00, f"{ivp:.0f}%", "NORMAL", "#f39c12")
+        else: res = (0.50, f"{ivp:.0f}%", "LOW", "#e74c3c")
+    history.append(current_iv)
+    if len(history) > MAX_IV_HISTORY: history.pop(0)
+    _persistent_history[exp_code] = history
+    save_iv_history(_persistent_history)
+    return res
 
-def total_score(s1, s2, s3, s4):
-    t = round(s1 + s2 + s3 + s4, 2)
-    if t >= GO_THRESHOLD:   return t, "GO",    COLORS["go"]
-    if t >= WARN_THRESHOLD: return t, "WATCH", COLORS["watch"]
-    return t, "WAIT", COLORS["wait"]
+def classify_premium_state(df):
+    if len(df) < 5: return dict(state="NO SPIKE", sublabel="...", score=0.5, color=COLORS["no_spike"])
+    prem = df["premium"].to_numpy(); ema = df["ema5"].to_numpy()
+    cp = float(prem[-1]); ce = float(ema[-1])
+    win = prem[-16:] if len(prem) >= 16 else prem
+    pv = float(np.max(win)); pe = (pv - float(np.mean(win))) / (float(np.mean(win)) + 1e-9) * 100
+    pfp = (pv - cp) / (pv + 1e-9) * 100
+    es = ((ce - ema[-4]) / ema[-4] * 100) if len(ema) >= 4 else 0.0
+    diffs = np.diff(prem[-9:]); cd, cu = 0, 0
+    for d in reversed(diffs):
+        if d < 0:
+            if cu > 0: break
+            cd += 1
+        elif d > 0:
+            if cd > 0: break
+            cu += 1
+        else: break
+    if pe < T_SPIKE_MIN_EXPANSION: return dict(state="NO SPIKE", sublabel=f"exp < {T_SPIKE_MIN_EXPANSION}%", score=0.5, color=COLORS["no_spike"])
+    if pfp > T_STALE_DROP_PCT: return dict(state="STALE", sublabel=f"−{pfp:.0f}% drop", score=0.0, color=COLORS["stale"])
+    if cu >= T_CONSEC_UP_SPIKING and es > 0.0 and cp > ce: return dict(state="SPIKING", sublabel=f"{cu}↑ consec · Prem>EMA", score=0.5, color=COLORS["spiking"])
+    if cd >= T_CONSEC_DOWN_CASE_A and es < T_EMA_SLOPE_CASE_A and cp < ce: return dict(state="CASE A", sublabel=f"{cd}↓ drops · Prem<EMA", score=3.5, color=COLORS["case_a"])
+    if cd >= T_CONSEC_DOWN_ROLLING and es < T_EMA_SLOPE_ROLLING and cp < ce: return dict(state="ROLLING", sublabel=f"{cd}↓ drops · Prem<EMA", score=2.5, color=COLORS["rolling"])
+    return dict(state="COOLING", sublabel="watch", score=1.0, color=COLORS["cooling"])
 
 # ══════════════════════════════════════════
-# 5. PER-PANEL CHART (returns fig, score info)
+# 4. DATA FETCH & PERSISTENT RV
 # ══════════════════════════════════════════
-def build_panel_figure(exp_code: str, data: dict):
-    """
-    Build and return a matplotlib figure for one expiry.
-    Caller is responsible for plt.close(fig) after st.pyplot().
-    """
-    df  = data["df"]
-    atm = data["atm"]
-    iv  = data["iv"]
-    rv  = compute_rv(df)
-    now = datetime.now(IST)
+def compute_30d_rv():
+    try:
+        now = int(time.time()); start = now - (30 * 24 * 3600)
+        r = requests.get(f"{BASE_URL}/history/candles", params={"symbol": "BTCUSD", "resolution": "1d", "start": start, "end": now}, verify=False, timeout=12).json()
+        df = pd.DataFrame(r.get("result", []))
+        if len(df) < 2: return 20.0
+        rets = np.log(df["close"] / df["close"].shift(1)).dropna()
+        return round(rets.std() * np.sqrt(365) * 100, 2)
+    except Exception as e: print(f"RV Error: {e}"); return 20.0
 
-    cp = df["premium"].iloc[-1]
-    ce = df["ema5"].iloc[-1]
+def extract_live_atm_iv(tickers, exp_code, atm_s):
+    c_s, p_s = f"C-BTC-{int(atm_s)}-{exp_code}", f"P-BTC-{int(atm_s)}-{exp_code}"
+    ivs = []
+    for t in tickers:
+        if t["symbol"] in (c_s, p_s):
+            v = t.get("mark_iv") or t.get("implied_volatility") or t.get("iv")
+            if v is not None:
+                try: ivs.append(float(v))
+                except Exception as e: print(f"IV Conversion Error: {e}"); continue
+    if not ivs: return None
+    avg = sum(ivs) / len(ivs)
+    return avg * 100 if avg < 2.0 else avg
 
-    # ── scores ──────────────────────────────
-    s1, dots, l1 = score_premium_direction(df)
-    s2, l2       = score_iv_rv(iv, rv)
-    s3, l3       = score_ratio(cp, data["spot"])
-    s4, l4       = score_iv_pct(iv)
-    tot, verd, vcol = total_score(s1, s2, s3, s4)
+def fetch_expiry_data(exp_code, spot, tickers):
+    try:
+        now_ts = int(time.time()); start = now_ts - LOOKBACK_HOURS * 3600
+        df_spot = align_and_dedupe(_candles("BTCUSD", start, now_ts), "btc_price")
+        if df_spot.empty: return None
+        strikes = sorted({float(t['symbol'].split('-')[2]) for t in tickers if t['symbol'].endswith(exp_code)})
+        if not strikes: return None
+        s_arr = np.array(strikes); df_spot["atm"] = s_arr[np.abs(s_arr[:, None] - df_spot["btc_price"].to_numpy()[None, :]).argmin(axis=0)]
+        atm_map = df_spot.set_index("time")["atm"].to_dict()
+        spot_map = df_spot.set_index("time")["btc_price"].to_dict()
+        rows = []
+        for atm_s in df_spot["atm"].unique():
+            df_c = align_and_dedupe(_candles(f"MARK:C-BTC-{int(atm_s)}-{exp_code}", start, now_ts), "c")
+            df_p = align_and_dedupe(_candles(f"MARK:P-BTC-{int(atm_s)}-{exp_code}", start, now_ts), "p")
+            if not df_c.empty and not df_p.empty:
+                m = pd.merge(df_c, df_p, on="time")
+                for _, r in m.iterrows():
+                    if atm_map.get(r["time"]) == atm_s:
+                        rows.append({"time": r["time"], "premium": r["c"] + r["p"], "btc_price": spot_map[r["time"]], "atm": atm_s})
+        df = pd.DataFrame(rows).sort_values("time").reset_index(drop=True)
+        df["premium"] = df["premium"].rolling(window=2).mean().fillna(df["premium"]) 
+        df["ema5"] = df["premium"].ewm(span=EMA_SPAN, adjust=False).mean()
+        df["datetime"] = pd.to_datetime(df["time"], unit="s").dt.tz_localize("UTC").dt.tz_convert(IST)
+        df["atm_changed"] = df["atm"].ne(df["atm"].shift()); df.iloc[0, df.columns.get_loc("atm_changed")] = False
+        live_iv = extract_live_atm_iv(tickers, exp_code, s_arr[np.abs(s_arr - spot).argmin()])
+        return {"df": df, "atm": s_arr[np.abs(s_arr - spot).argmin()], "spot": spot, "iv": live_iv}
+    except Exception as e: print(f"Fetch Error: {e}"); return None
 
-    # ── figure ──────────────────────────────
-    plt.style.use("dark_background")
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.set_facecolor(COLORS["surface"])
+# ══════════════════════════════════════════
+# 5. UI FRAMEWORK
+# ══════════════════════════════════════════
+_CARD_NUMS = ["①", "②", "③", "④"]
+
+def build_figure(expiries):
+    n = len(expiries); cols = 2; rows = (n + 1) // 2
+    plt.style.use('dark_background')
+    fig = plt.figure(figsize=(20, 6.2 * rows))
     fig.patch.set_facecolor(COLORS["bg"])
+    outer = gridspec.GridSpec(rows, cols, figure=fig, hspace=0.4, wspace=0.2)
+    axes = {}
+    for i, exp in enumerate(expiries):
+        r, c = divmod(i, cols)
+        inner = gridspec.GridSpecFromSubplotSpec(2, 1, subplot_spec=outer[r, c], height_ratios=[5, 1], hspace=0.08)
+        ax_m = fig.add_subplot(inner[0]); ax_c = fig.add_subplot(inner[1])
+        ax_m.set_facecolor(COLORS["surface"]); ax_c.axis("off")
+        axes[exp] = {"main": ax_m, "cards": ax_c}
+    _fig_state.update(expiries=list(expiries), fig=fig, axes=axes)
+    return fig
 
-    ax.plot(df["datetime"], df["premium"],
-            color=COLORS["premium"], marker="o", markersize=5,
-            linewidth=1.8, label="Premium", zorder=4)
-    ax.plot(df["datetime"], df["ema5"],
-            color=COLORS["ema"], linewidth=2.4,
-            label=f"EMA-{EMA_SPAN}", zorder=3)
-    ax.axhline(y=cp, color=COLORS["premium"], linestyle=":", alpha=0.45, linewidth=1)
-
-    # Y-axis right
-    ax.yaxis.tick_right()
-    ax.yaxis.set_label_position("right")
-
+def draw_panel(exp_code, data, btc_rv):
+    axd = _fig_state["axes"][exp_code]; df = data["df"]; iv = data["iv"]; ax = axd["main"]; ax.clear()
+    cp, ce = df["premium"].iloc[-1], df["ema5"].iloc[-1]
+    st = classify_premium_state(df); s2, v2, sub2, c2 = score_iv_rv(iv, btc_rv)
+    s3, v3, sub3, c3 = score_ratio(cp, data["spot"]); s4, v4, sub4, c4 = score_iv_percentile(iv, exp_code)
+    tot = st["score"] + s2 + s3 + s4
     y_vals = pd.concat([df["premium"], df["ema5"]]).dropna()
-    if not y_vals.empty:
-        ylo, yhi = y_vals.min(), y_vals.max()
-        pad = max((yhi - ylo) * 0.25, 10)
-        ax.set_ylim(ylo - pad, yhi + pad)
+    ylo, yhi = y_vals.min() - max((y_vals.max() - y_vals.min()) * 0.20, 5), y_vals.max() + max((y_vals.max() - y_vals.min()) * 0.20, 5)
+    ax.set_ylim(ylo, yhi)
+    for _, sr in df[df["atm_changed"]].iterrows():
+        ax.axvline(x=sr["datetime"], color=COLORS["atm_chg"], linestyle="--", alpha=0.5)
+        ax.text(sr["datetime"], yhi, f" {int(sr['atm']):,}", color=COLORS["atm_chg"], fontsize=7, rotation=90, va="top")
+    ax.plot(df["datetime"], df["premium"], color=COLORS["premium"], marker="o", markersize=4, label="Premium")
+    ax.plot(df["datetime"], df["ema5"], color=COLORS["ema"], linewidth=2, label="EMA-5")
+    ax.axhline(y=cp, color=COLORS["premium"], linestyle=":", alpha=0.4); ax.yaxis.tick_right(); ax.yaxis.set_label_position("right")
+    y_range = yhi - ylo; p_off, e_off = (12, -12) if cp >= ce else (-12, 12) if abs(cp-ce) < y_range*0.12 else (0,0)
+    ax.annotate(f"{cp:.1f}", xy=(1, cp), xycoords=("axes fraction", "data"), xytext=(6, p_off), textcoords="offset points", ha="left", va="center", fontsize=9, weight="bold", color="white", bbox=dict(facecolor=COLORS["premium"], edgecolor="none", pad=3), annotation_clip=False)
+    ax.annotate(f"{ce:.1f}", xy=(1, ce), xycoords=("axes fraction", "data"), xytext=(6, e_off), textcoords="offset points", ha="left", va="center", fontsize=9, weight="bold", color="#0b0c10", bbox=dict(facecolor=COLORS["ema"], edgecolor="none", pad=3), annotation_clip=False)
+    ax.set_title(f"BTC {expiry_label(exp_code)} | Score: {tot:.1f}", loc="left", color="white", weight="bold")
+    axd["cards"].clear(); _draw_score_cards(axd["cards"], [dict(label="Premium dir", value=st["state"], sublabel=st["sublabel"], value_color=st["color"]), dict(label="IV/RV spread", value=v2, sublabel=sub2, value_color=c2), dict(label="Ratio", value=v3, sublabel=sub3, value_color=c3), dict(label="IV Percentile", value=v4, sublabel=sub4, value_color=c4)])
 
-    # ── label overlap fix (from test.py) ────
-    ylim = ax.get_ylim()
-    min_sep = (ylim[1] - ylim[0]) * 0.06
-    p_label_y, e_label_y = cp, ce
-    if abs(p_label_y - e_label_y) < min_sep:
-        if p_label_y >= e_label_y:
-            p_label_y += min_sep / 2
-            e_label_y -= min_sep / 2
-        else:
-            p_label_y -= min_sep / 2
-            e_label_y += min_sep / 2
-
-    ax.annotate(
-        f"{cp:.2f}",
-        xy=(1, p_label_y), xycoords=("axes fraction", "data"),
-        xytext=(8, 0), textcoords="offset points",
-        ha="left", va="center", fontsize=9, weight="bold", color="white",
-        bbox=dict(facecolor=COLORS["premium"], edgecolor="none", pad=3),
-        annotation_clip=False,
-    )
-    ax.annotate(
-        f"{ce:.2f}",
-        xy=(1, e_label_y), xycoords=("axes fraction", "data"),
-        xytext=(8, 0), textcoords="offset points",
-        ha="left", va="center", fontsize=9, weight="bold", color="#0b0c10",
-        bbox=dict(facecolor=COLORS["ema"], edgecolor="none", pad=3),
-        annotation_clip=False,
-    )
-
-    # X-axis time
-    ax.set_xlim(now - timedelta(hours=12.5), now + timedelta(minutes=45))
-    ax.xaxis.set_major_locator(mdates.HourLocator(interval=3, tz=IST))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=IST))
-    plt.setp(ax.xaxis.get_majorticklabels(), rotation=30, ha="right", fontsize=7, color="#888")
-    plt.setp(ax.yaxis.get_majorticklabels(), color="#888")
-    ax.grid(color=COLORS["grid"], alpha=0.35, linewidth=0.6)
-
-    # Days-to-expiry badge
-    exp_date = datetime.strptime(exp_code, "%d%m%y").date()
-    dte      = (exp_date - now.date()).days
-    dte_str  = f"{dte}d to exp" if dte > 0 else "EXPIRY TODAY"
-
-    # Title + verdict badge
-    ax.set_title(
-        f"BTC  {expiry_label(exp_code)}   {dte_str}   ATM {int(atm):,}   {now.strftime('%H:%M:%S')}",
-        loc="left", fontsize=10, color="white", pad=8, weight="bold",
-    )
-    ax.text(
-        0.99, 1.02, f"Score {tot:.1f}  {verd}",
-        transform=ax.transAxes, ha="right", va="bottom",
-        color="white", weight="bold", fontsize=10,
-        bbox=dict(facecolor=vcol, edgecolor="none", pad=4, alpha=0.9),
-    )
-
-    ax.legend(loc="lower left", fontsize=8, framealpha=0.25, ncol=2)
-
-    return fig, {
-        "tot": tot, "verd": verd, "vcol": vcol,
-        "cp": cp, "ce": ce, "iv": iv, "rv": rv,
-        "l1": l1, "l2": l2, "l3": l3, "l4": l4,
-        "s1": s1, "s2": s2, "s3": s3, "s4": s4,
-        "dots": dots,
-    }
+def _draw_score_cards(ax, cards):
+    from matplotlib.patches import FancyBboxPatch
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+    n = len(cards); pad, gap = 0.012, 0.01; total_w = 1.0 - 2*pad - (n-1)*gap; cw = total_w/n
+    for i, c in enumerate(cards):
+        x0 = pad + i*(cw+gap); cx = x0+cw/2
+        ax.add_patch(FancyBboxPatch((x0, 0.04), cw, 0.92, boxstyle="round,pad=0.015", facecolor=COLORS["score_bg"], edgecolor=COLORS["card_bdr"], linewidth=0.8, transform=ax.transAxes, clip_on=False))
+        ax.text(cx, 0.88, _CARD_NUMS[i], ha="center", va="center", fontsize=8, color="#666", transform=ax.transAxes)
+        ax.text(cx, 0.72, c["label"], ha="center", va="center", fontsize=7.5, color="#999", transform=ax.transAxes)
+        ax.text(cx, 0.46, c["value"], ha="center", va="center", fontsize=12, weight="bold", color=c["value_color"], transform=ax.transAxes)
+        ax.text(cx, 0.18, f"{c['sublabel']}", ha="center", va="center", fontsize=7, color="#888", transform=ax.transAxes)
 
 # ══════════════════════════════════════════
-# 6. MAIN STREAMLIT APP
+# 6. HELPERS & STARTUP
 # ══════════════════════════════════════════
+def _candles(s, st, en):
+    try: return requests.get(f"{BASE_URL}/history/candles", params={"symbol": s, "resolution": "30m", "start": st, "end": en}, verify=False, timeout=12).json().get("result", [])
+    except Exception as e: print(f"API Error ({s}): {e}"); return []
 
-# ── Telegram alert state (persists across reruns via st.session_state) ──
-if "alerted" not in st.session_state:
-    st.session_state.alerted = {}
+def fetch_spot_and_tickers():
+    try:
+        r = requests.get(f"{BASE_URL}/tickers", timeout=12, verify=False).json(); tics = r.get("result", [])
+        spot = float(next(t for t in tics if t["symbol"] == "BTCUSD")["mark_price"])
+        return spot, tics
+    except Exception as e: print(f"Ticker Error: {e}"); return 0.0, []
 
-st.title("₿ BTC Multi-Expiry Straddle Scanner")
-st.caption(f"Auto-refreshes every {REFRESH_SECONDS // 60} minutes · Data: Delta Exchange India · IST")
+def align_and_dedupe(raw, col):
+    if not raw: return pd.DataFrame(columns=["time", col])
+    df = pd.DataFrame(raw)[["time", "close"]].rename(columns={"close": col})
+    df["time"] = (df["time"].astype(int)//CANDLE_SECONDS)*CANDLE_SECONDS
+    return df.drop_duplicates("time")
 
-# ── Fetch spot + tickers ──────────────────────────────────────────────
-with st.spinner("Fetching market data…"):
-    spot, tickers = fetch_spot_and_tickers()
+def update(frame):
+    exps = active_expiries(); spot, tics = fetch_spot_and_tickers()
+    if spot <= 0: return
+    rv_30d = compute_30d_rv()
+    for exp in exps:
+        ensure_state(exp); data = fetch_expiry_data(exp, spot, tics)
+        if data: draw_panel(exp, data, rv_30d)
 
-if spot <= 0:
-    st.error("⚠️ Could not connect to Delta Exchange. Check your internet connection.")
-    st.stop()
-
-# ── Header row ───────────────────────────────────────────────────────
-col_spot, col_time, col_refresh = st.columns([1, 1, 1])
-with col_spot:
-    st.metric("BTC Spot (Mark)", f"${spot:,.2f}")
-with col_time:
-    st.metric("Last Updated", datetime.now(IST).strftime("%H:%M:%S IST"))
-with col_refresh:
-    st.metric("Next Refresh", f"in {REFRESH_SECONDS // 60} min")
-
-st.divider()
-
-# ── Active expiries ───────────────────────────────────────────────────
-active = active_expiries()
-
-if not active:
-    st.warning("No active BTC expiries found. All May 2026 expiries have passed.")
-    st.stop()
-
-# ── 2-column panel grid ───────────────────────────────────────────────
-cols = st.columns(2)
-
-for i, exp_code in enumerate(active):
-    with cols[i % 2]:
-        label = expiry_label(exp_code)
-
-        with st.spinner(f"Loading {label}…"):
-            data = fetch_expiry_data(exp_code, spot, tickers)
-
-        if data is None or data["df"] is None or len(data["df"]) < 2:
-            st.info(f"⏳ {label}: Awaiting data or no options found for this expiry.")
-            continue
-
-        # Build figure
-        fig, scores = build_panel_figure(exp_code, data)
-        st.pyplot(fig)
-        plt.close(fig)   # prevent memory warning
-
-        # ── Score card below chart ───────────────────────────────────
-        tot   = scores["tot"]
-        verd  = scores["verd"]
-        vcol  = scores["vcol"]
-
-        verdict_emoji = "🟢" if verd == "GO" else ("🟡" if verd == "WATCH" else "🔴")
-        st.markdown(
-            f"**{verdict_emoji} {verd}** &nbsp; Score: `{tot:.1f}` &nbsp;|&nbsp; "
-            f"Direction: `{scores['l1']}` &nbsp;|&nbsp; "
-            f"IV/RV: `{scores['l2']}` &nbsp;|&nbsp; "
-            f"Ratio: `{scores['l3']}` &nbsp;|&nbsp; "
-            f"IV: `{scores['l4']}`"
-        )
-
-        # ── Telegram alert (fire once per GO per expiry per session) ─
-        alert_key = f"{exp_code}_{verd}"
-        if verd == "GO" and not st.session_state.alerted.get(alert_key):
-            cp = scores["cp"]
-            msg = (
-                f"🚨 BTC Straddle ALERT\n"
-                f"Expiry : {label}\n"
-                f"Score  : {tot:.1f} — {verd}\n"
-                f"Premium: ${cp:.2f}\n"
-                f"IV/RV  : {scores['l2']}\n"
-                f"Time   : {datetime.now(IST).strftime('%H:%M:%S IST')}"
-            )
-            send_telegram(msg)
-            st.session_state.alerted[alert_key] = True
-            st.toast(f"🚨 Telegram alert sent for {label}!", icon="📲")
-
-st.divider()
-st.caption(
-    f"Scores — Direction (/3.5) · IV/RV (/3.5) · Ratio (/0.75) · IV% (/0.75) · "
-    f"GO ≥ {GO_THRESHOLD} · WATCH ≥ {WARN_THRESHOLD}"
-)
-
-# ══════════════════════════════════════════
-# 7. AUTO-REFRESH
-# ══════════════════════════════════════════
-time.sleep(REFRESH_SECONDS)
-st.rerun()
+if __name__ == "__main__":
+    init_exps = active_expiries()
+    if init_exps:
+        fig = build_figure(init_exps)
+        ani = FuncAnimation(fig, update, interval=REFRESH_INTERVAL_MS, cache_frame_data=False)
+        plt.show()
