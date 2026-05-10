@@ -1,3 +1,28 @@
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment / secrets
 .env
+*.env
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Runtime data
+iv_history.json
+
+# OS
+.DS_Store
+Thumbs.db
