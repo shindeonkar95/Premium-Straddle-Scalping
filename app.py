@@ -1,12 +1,12 @@
 import warnings
 warnings.filterwarnings("ignore")
 
-import os
 import requests
 import pandas as pd
 import numpy as np
 import streamlit as st
 import matplotlib.pyplot as plt
+
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -31,11 +31,11 @@ ALL_EXPIRIES_DDMMYY = [
 ]
 
 # =====================================================
-# PAGE CONFIG
+# STREAMLIT PAGE
 # =====================================================
 
 st.set_page_config(
-    page_title="Premium Straddle Scanner",
+    page_title="BTC Premium Scanner",
     layout="wide"
 )
 
@@ -51,36 +51,43 @@ def expiry_label(code):
 
 def active_expiries():
     today = datetime.now(IST).date()
+
     return [
         c for c in ALL_EXPIRIES_DDMMYY
         if datetime.strptime(c, "%d%m%y").date() >= today
     ]
 
 def fetch_spot_and_tickers():
+
     try:
+
         r = requests.get(
             f"{BASE_URL}/tickers",
             timeout=10,
             verify=False
         ).json()
 
-        tics = r.get("result", [])
+        tickers = r.get("result", [])
 
         spot = float(
             next(
-                t for t in tics
+                t for t in tickers
                 if t["symbol"] == "BTCUSD"
             )["mark_price"]
         )
 
-        return spot, tics
+        return spot, tickers
 
     except Exception as e:
+
         st.error(f"Ticker Error: {e}")
+
         return 0.0, []
 
 def candles(symbol, start, end):
+
     try:
+
         r = requests.get(
             f"{BASE_URL}/history/candles",
             params={
@@ -96,9 +103,11 @@ def candles(symbol, start, end):
         return r.get("result", [])
 
     except:
+
         return []
 
 def align(raw, col):
+
     if not raw:
         return pd.DataFrame(columns=["time", col])
 
@@ -106,15 +115,18 @@ def align(raw, col):
 
     df = df.rename(columns={"close": col})
 
+    df["time"] = df["time"].astype(int)
+
     return df.drop_duplicates("time")
 
 # =====================================================
-# MAIN DATA FETCH
+# FETCH EXPIRY DATA
 # =====================================================
 
 def fetch_expiry_data(exp_code, spot, tickers):
 
     now_ts = int(datetime.now().timestamp())
+
     start = now_ts - LOOKBACK_HOURS * 3600
 
     df_spot = align(
@@ -126,9 +138,13 @@ def fetch_expiry_data(exp_code, spot, tickers):
         return None
 
     strikes = sorted({
+
         float(t['symbol'].split('-')[2])
+
         for t in tickers
+
         if t['symbol'].endswith(exp_code)
+
     })
 
     if not strikes:
@@ -138,7 +154,8 @@ def fetch_expiry_data(exp_code, spot, tickers):
 
     df_spot["atm"] = s_arr[
         np.abs(
-            s_arr[:, None] -
+            s_arr[:, None]
+            -
             df_spot["btc_price"].to_numpy()[None, :]
         ).argmin(axis=0)
     ]
@@ -164,16 +181,18 @@ def fetch_expiry_data(exp_code, spot, tickers):
 
         if not df_c.empty and not df_p.empty:
 
-            m = pd.merge(df_c, df_p, on="time")
+            merged = pd.merge(df_c, df_p, on="time")
 
-            for _, r in m.iterrows():
+            for _, row in merged.iterrows():
 
-                if atm_map.get(r["time"]) == atm_s:
+                if atm_map.get(row["time"]) == atm_s:
 
                     rows.append({
-                        "time": r["time"],
-                        "premium": r["c"] + r["p"],
+
+                        "time": row["time"],
+                        "premium": row["c"] + row["p"],
                         "atm": atm_s
+
                     })
 
     if not rows:
@@ -196,14 +215,17 @@ def fetch_expiry_data(exp_code, spot, tickers):
     return df
 
 # =====================================================
-# CHART
+# MAIN
 # =====================================================
 
 spot, tickers = fetch_spot_and_tickers()
 
 if spot > 0:
 
-    st.metric("BTC Spot", f"{spot:,.0f}")
+    st.metric(
+        "BTC Spot Price",
+        f"{spot:,.0f}"
+    )
 
     expiries = active_expiries()
 
@@ -211,28 +233,135 @@ if spot > 0:
 
         st.subheader(f"Expiry: {expiry_label(exp)}")
 
-        df = fetch_expiry_data(exp, spot, tickers)
+        df = fetch_expiry_data(
+            exp,
+            spot,
+            tickers
+        )
 
         if df is None:
-            st.warning("No data")
+
+            st.warning("No data found")
+
             continue
 
-        fig, ax = plt.subplots(figsize=(12, 5))
+        # ==========================================
+        # CREATE FIGURE
+        # ==========================================
+
+        fig, ax = plt.subplots(
+            figsize=(12, 5)
+        )
+
+        # ==========================================
+        # PLOT LINES
+        # ==========================================
 
         ax.plot(
             df["datetime"],
             df["premium"],
-            label="Premium"
+            label="Premium",
+            linewidth=2
         )
 
         ax.plot(
             df["datetime"],
             df["ema5"],
-            label="EMA5"
+            label="EMA5",
+            linewidth=2
         )
+
+        # ==========================================
+        # LATEST VALUES
+        # ==========================================
+
+        latest_premium = df["premium"].iloc[-1]
+        latest_ema = df["ema5"].iloc[-1]
+
+        # ==========================================
+        # PREVENT LABEL OVERLAP
+        # ==========================================
+
+        y_range = (
+            max(
+                df["premium"].max(),
+                df["ema5"].max()
+            )
+            -
+            min(
+                df["premium"].min(),
+                df["ema5"].min()
+            )
+        )
+
+        offset = y_range * 0.03
+
+        premium_offset = 0
+        ema_offset = 0
+
+        if abs(latest_premium - latest_ema) < offset:
+
+            premium_offset = 12
+            ema_offset = -12
+
+        # ==========================================
+        # PREMIUM LABEL
+        # ==========================================
+
+        ax.annotate(
+            f"{latest_premium:.1f}",
+            xy=(1, latest_premium),
+            xycoords=("axes fraction", "data"),
+            xytext=(8, premium_offset),
+            textcoords="offset points",
+            va="center",
+            fontsize=10,
+            fontweight="bold",
+            color="white",
+            bbox=dict(
+                facecolor="blue",
+                edgecolor="none",
+                pad=3
+            ),
+            clip_on=False
+        )
+
+        # ==========================================
+        # EMA LABEL
+        # ==========================================
+
+        ax.annotate(
+            f"{latest_ema:.1f}",
+            xy=(1, latest_ema),
+            xycoords=("axes fraction", "data"),
+            xytext=(8, ema_offset),
+            textcoords="offset points",
+            va="center",
+            fontsize=10,
+            fontweight="bold",
+            color="white",
+            bbox=dict(
+                facecolor="orange",
+                edgecolor="none",
+                pad=3
+            ),
+            clip_on=False
+        )
+
+        # ==========================================
+        # STYLING
+        # ==========================================
+
+        ax.grid(True)
 
         ax.legend()
 
-        ax.grid(True)
+        ax.set_title(
+            f"BTC {expiry_label(exp)}",
+            fontsize=14,
+            fontweight="bold"
+        )
+
+        plt.subplots_adjust(right=0.88)
 
         st.pyplot(fig)
