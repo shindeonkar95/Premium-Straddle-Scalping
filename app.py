@@ -1,7 +1,6 @@
 import streamlit as st
 import os, requests, pandas as pd, numpy as np, time, json
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import urllib3
@@ -11,7 +10,7 @@ from dotenv import load_dotenv
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv()
 
-st.set_page_config(page_title="Premium Straddle Scalper", layout="wide")
+st.set_page_config(page_title="Premium Straddle Scalper v7.16", layout="wide")
 
 # API & Constants
 BASE_URL = "https://api.india.delta.exchange/v2"
@@ -21,18 +20,16 @@ LOOKBACK_HOURS = 12
 CANDLE_SECONDS = 30 * 60
 ALL_EXPIRIES_DDMMYY = ["100526", "110526", "120526", "150526", "220526", "290526"]
 
-# Colors
+# Visual Theme
 COLORS = {
-    "premium": "#ff9800", "ema": "#2ecc71", "atm_chg": "#9b59b6",
-    "bg": "#0b0c10", "surface": "#161d27", "case_a": "#27ae60",
-    "rolling": "#f39c12", "wait": "#e74c3c", "no_spike": "#7f8c8d"
+    "premium": "#ff9800", 
+    "ema": "#2ecc71", 
+    "bg": "#0b0c10", 
+    "surface": "#161d27",
+    "border": "#252e3b"
 }
 
-# --- SESSION STATE FOR HISTORY ---
-if 'iv_history' not in st.session_state:
-    st.session_state.iv_history = {}
-
-# --- CORE FUNCTIONS ---
+# --- CORE DATA FUNCTIONS ---
 
 def get_active_expiries():
     today = datetime.now(IST).date()
@@ -104,43 +101,67 @@ def fetch_expiry_data(exp_code, spot, tickers):
     
     return {"df": df, "iv": live_iv, "atm": atm_now}
 
-# --- STREAMLIT UI COMPONENTS ---
+# --- PLOTTING ENGINE ---
 
 def create_plot(exp_code, data):
     df = data["df"]
-    fig, ax = plt.subplots(figsize=(10, 4))
+    # Smaller, dashboard-optimized figure
+    fig, ax = plt.subplots(figsize=(8, 3.8)) 
     plt.style.use('dark_background')
     fig.patch.set_facecolor(COLORS["bg"])
     ax.set_facecolor(COLORS["surface"])
     
-    ax.plot(df["datetime"], df["premium"], color=COLORS["premium"], marker="o", markersize=3, label="Straddle")
-    ax.plot(df["datetime"], df["ema5"], color=COLORS["ema"], linewidth=1.5, label="EMA-5")
+    # Plotting
+    ax.plot(df["datetime"], df["premium"], color=COLORS["premium"], marker="o", markersize=2, linewidth=1, label="Straddle")
+    ax.plot(df["datetime"], df["ema5"], color=COLORS["ema"], linewidth=1.2, label="EMA-5")
     
-    ax.set_title(f"Expiry: {exp_code}", color="white")
-    ax.grid(color="#2b323b", linestyle="--", alpha=0.3)
+    # Clean up aesthetics
+    ax.tick_params(axis='both', which='major', labelsize=8, colors='#888')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.grid(color="#2b323b", linestyle="--", alpha=0.2)
+    
+    # Label formatting
+    plt.xticks(rotation=0) 
+    fig.tight_layout()
     return fig
 
-# --- MAIN LOOP ---
+# --- MAIN UI DISPLAY ---
+
+st.markdown("""
+    <style>
+    .main { background-color: #0b0c10; }
+    [data-testid="stMetricValue"] { font-size: 22px !important; color: white; }
+    [data-testid="stMetricDelta"] { font-size: 13px !important; }
+    h3 { font-size: 18px !important; padding-top: 10px; color: #ff9800; }
+    </style>
+    """, unsafe_allow_html=True)
 
 st.title("🦅 Premium Straddle Scalper")
+
+# Sidebar for controls
+with st.sidebar:
+    st.header("Terminal Settings")
+    refresh_rate = st.slider("Data Refresh (sec)", 10, 300, 60)
+    st.info("Scanner v7.16 Production Build")
+
 placeholder = st.empty()
 
-# Sidebar Settings
-st.sidebar.header("Settings")
-refresh_rate = st.sidebar.slider("Refresh Interval (sec)", 10, 300, 60)
-
+# Persistent Loop
 while True:
     spot, tickers = fetch_spot_and_tickers()
     rv_30d = compute_30d_rv()
     expiries = get_active_expiries()
     
     with placeholder.container():
-        # Top Stats
-        col1, col2, col3 = st.columns(3)
-        col1.metric("BTC Spot", f"${spot:,.2f}")
-        col2.metric("30D RV", f"{rv_30d}%")
-        col3.metric("Last Update", datetime.now(IST).strftime("%H:%M:%S"))
+        # Top Dashboard Row
+        h1, h2, h3 = st.columns(3)
+        h1.metric("BTC SPOT", f"${spot:,.2f}")
+        h2.metric("30D RV", f"{rv_30d}%")
+        h3.metric("IST TIME", datetime.now(IST).strftime("%H:%M:%S"))
         
+        st.divider()
+
         # Grid for Expiries
         for i in range(0, len(expiries), 2):
             cols = st.columns(2)
@@ -150,17 +171,19 @@ while True:
                     data = fetch_expiry_data(exp, spot, tickers)
                     if data:
                         with cols[j]:
-                            st.subheader(f"BTC-{exp}")
-                            # Score Cards (simplified for Streamlit)
-                            iv_val = data["iv"]
-                            spread = iv_val - rv_30d
-                            
-                            m1, m2 = st.columns(2)
-                            m1.metric("IV", f"{iv_val:.1f}%", f"{spread:+.1f} spread")
-                            m2.metric("ATM Strike", int(data["atm"]))
-                            
-                            fig = create_plot(exp, data)
-                            st.pyplot(fig)
-                            plt.close(fig)
+                            # Using 'border=True' creates the card look
+                            with st.container(border=True):
+                                st.subheader(f"BTC {exp[:2]} {datetime.strptime(exp, '%d%m%y').strftime('%b')}")
+                                
+                                iv_val = data["iv"]
+                                spread = iv_val - rv_30d
+                                
+                                m1, m2 = st.columns(2)
+                                m1.metric("Live IV", f"{iv_val:.1f}%", f"{spread:+.1f} vs RV")
+                                m2.metric("ATM Strike", f"{int(data['atm']):,}")
+                                
+                                fig = create_plot(exp, data)
+                                st.pyplot(fig, use_container_width=True)
+                                plt.close(fig)
     
     time.sleep(refresh_rate)
