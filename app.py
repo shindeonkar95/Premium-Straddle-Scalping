@@ -18,6 +18,8 @@ from core import (
     COLORS,
     EMA_SPAN,
     expiry_label,
+    IVP_CHEAP,
+    IVP_RICH,
 )
 
 # ══════════════════════════════════════════
@@ -70,7 +72,7 @@ def build_chart(exp_code: str, result: dict) -> plt.Figure:
     ce  = df["ema5"].iloc[-1]
     st_ = result["state"]
 
-    fig = plt.figure(figsize=(10, 5), facecolor=COLORS["bg"])
+    fig = plt.figure(figsize=(10, 5), facecolor=COLORS["bg"], constrained_layout=True)
     gs  = gridspec.GridSpec(2, 1, height_ratios=[5, 1], hspace=0.08, figure=fig)
     ax  = fig.add_subplot(gs[0])
     ax_c = fig.add_subplot(gs[1])
@@ -131,7 +133,6 @@ def build_chart(exp_code: str, result: dict) -> plt.Figure:
         dict(label="IV Percentile",value=result["iv_pct"]["value"], sublabel=result["iv_pct"]["sublabel"], value_color=result["iv_pct"]["color"]),
     ])
 
-    fig.tight_layout(pad=0.5)
     return fig
 
 def _draw_score_cards(ax, cards):
@@ -203,11 +204,38 @@ def render_dashboard():
     meta = results.get("__meta__", {})
     expiries = meta.get("expiries", [])
 
+    mkt_iv  = meta.get("mkt_iv")
+    mkt_rv  = meta.get("mkt_rv")
+    ivp     = meta.get("ivp")
+    iv_days = meta.get("iv_history_days", 0)
+
+    iv_str  = f"{mkt_iv:.2f}%" if mkt_iv is not None else "N/A"
+    rv_str  = f"{mkt_rv:.2f}%" if mkt_rv is not None else "N/A"
+    ivp_str = f"{ivp:.0f}%" if ivp is not None else "N/A"
+
+    if mkt_iv is not None and mkt_rv is not None:
+        spread = round(mkt_iv - mkt_rv, 2)
+        iv_rv_signal = "IV&gt;RV ▲" if spread >= 0 else "IV&lt;RV ▼"
+        iv_rv_color  = "#e74c3c" if spread >= 0 else "#27ae60"
+        iv_rv_html   = f'<span style="color:{iv_rv_color};font-weight:700">{iv_rv_signal}</span>'
+    else:
+        iv_rv_html = '<span style="color:#888">N/A</span>'
+
+    if ivp is not None:
+        ivp_color = "#27ae60" if ivp < 25 else ("#e74c3c" if ivp > 75 else "#f39c12")
+        ivp_label = "CHEAP" if ivp < 25 else ("RICH" if ivp > 75 else "FAIR")
+        ivp_html  = f'<span style="color:{ivp_color};font-weight:700">{ivp_str} {ivp_label}</span>'
+    else:
+        ivp_html = '<span style="color:#888">N/A</span>'
+
     status_bar.markdown(
         f"**BTC Spot:** ${meta.get('spot', 0):,.0f} &nbsp;|&nbsp; "
-        f"**30d RV:** {meta.get('rv_30d', 0):.1f}% &nbsp;|&nbsp; "
-        f"**Expiries tracked:** {len(expiries)} &nbsp;|&nbsp; "
-        f"**Last refresh:** {meta.get('refreshed', '—')}"
+        f"**Market IV:** {iv_str} &nbsp;|&nbsp; "
+        f"**Market RV (30d):** {rv_str} &nbsp;|&nbsp; "
+        f"**IV/RV:** {iv_rv_html} &nbsp;|&nbsp; "
+        f"**IVP (90d / {iv_days}d data):** {ivp_html} &nbsp;|&nbsp; "
+        f"**Last refresh:** {meta.get('refreshed', '—')}",
+        unsafe_allow_html=True,
     )
 
     if not expiries:
@@ -221,25 +249,51 @@ def render_dashboard():
     for idx, (exp_code, result) in enumerate(exp_results.items()):
         with cols[idx % 2]:
             fig = build_chart(exp_code, result)
-            st.pyplot(fig, use_container_width=True)
+            st.pyplot(fig, width='stretch')
             plt.close(fig)
 
     # Summary table
     st.markdown("---")
     st.markdown("### 📋 Summary")
+
+    # Market-wide IV/RV + IVP info banner
+    if mkt_iv is not None and mkt_rv is not None:
+        spread = round(mkt_iv - mkt_rv, 2)
+        sig_color = "#e74c3c" if spread >= 0 else "#27ae60"
+        sig_text  = f"IV {'>' if spread >= 0 else '<'} RV  (Δ {spread:+.2f}%)"
+        st.markdown(
+            f'<div style="background:#0f1419;border:1px solid #252e3b;border-radius:8px;'
+            f'padding:10px 18px;margin-bottom:10px;font-size:0.9rem">'
+            f'📡 <b>Market-wide (Delta CDN 5m)</b> &nbsp;—&nbsp; '
+            f'ATM IV: <b>{mkt_iv:.2f}%</b> &nbsp;|&nbsp; '
+            f'RV (30d): <b>{mkt_rv:.2f}%</b> &nbsp;|&nbsp; '
+            f'Signal: <span style="color:{sig_color};font-weight:700">{sig_text}</span>'
+            f'&nbsp;|&nbsp; IVP (90d): {ivp_html}'
+            f'&nbsp; <span style="color:#555;font-size:0.8rem">'
+            f'({iv_days} daily readings — same scale as live IV)</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
     rows = []
     for exp_code, r in exp_results.items():
+        ivp_val  = r["ivp"]
+        ivp_disp = f"{ivp_val:.0f}%" if ivp_val is not None else "N/A"
+        ivp_lbl  = r["iv_pct"]["sublabel"]   # CHEAP / FAIR / RICH / collecting...
         rows.append({
-            "Expiry":     r["label"],
-            "Score":      f"{r['total_score']:.1f}",
-            "State":      r["state"]["state"],
-            "IV/RV":      r["iv_rv"]["sublabel"],
-            "Ratio":      r["ratio"]["sublabel"],
-            "IV Pct":     r["iv_pct"]["sublabel"],
-            "IV":         f"{r['iv']:.1f}%" if r["iv"] else "N/A",
-            "ATM Strike": f"{int(r['atm']):,}",
+            "Expiry":       r["label"],
+            "Score":        f"{r['total_score']:.1f}",
+            "State":        r["state"]["state"],
+            "IV/RV":        r["iv_rv"]["value"],      # IV>RV or IV<RV
+            "IV/RV signal": r["iv_rv"]["sublabel"],   # RICH Δ+X / FAIR Δ+X / RISK Δ-X
+            "Ratio":        r["ratio"]["sublabel"],
+            "IVP (90d)":    ivp_disp,
+            "IVP Label":    ivp_lbl,
+            "Mkt IV":       f"{r['mkt_iv']:.2f}%" if r.get("mkt_iv") else "N/A",
+            "Mkt RV":       f"{r['mkt_rv']:.2f}%" if r.get("mkt_rv") else "N/A",
+            "ATM Strike":   f"{int(r['atm']):,}",
         })
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
 
 render_dashboard()
 
