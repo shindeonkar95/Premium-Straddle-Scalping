@@ -16,6 +16,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # CONFIG
 # ══════════════════════════════════════════
 BASE_URL        = "https://api.india.delta.exchange/v2"
+DELTA_CDN       = "https://cdn.india.deltaex.org/v2"
 IST             = ZoneInfo("Asia/Kolkata")
 HISTORY_FILE    = "iv_history.json"
 
@@ -25,6 +26,20 @@ EMA_SPAN        = 5
 MAX_EXPIRIES    = 6
 MAX_IV_HISTORY  = 10000
 SAVE_COOLDOWN_SEC = 3600
+
+# ── Market-wide IV/RV and IVP config (from BTC_IV_RV_Monitor) ────────────────
+CDN_ASSET         = "BTC"
+CDN_MATURITY      = "daily"
+CDN_LIVE_DAYS     = 7      # lookback for live 5m CDN IV/RV
+IVP_LOOKBACK_DAYS = 90     # days of history for IVP baseline
+IVP_CHEAP         = 25     # IVP < 25  → CHEAP
+IVP_RICH          = 75     # IVP > 75  → RICH
+CDN_HEADERS       = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko)"
+    )
+}
 
 # Tuning thresholds
 T_STALE_DROP_PCT      = 25.0
@@ -155,38 +170,89 @@ def score_iv_percentile(current_iv, exp_code: str):
 # CLASSIFIER
 # ══════════════════════════════════════════
 def classify_premium_state(df: pd.DataFrame) -> dict:
-    if len(df) < 5:
-        return dict(state="NO SPIKE", sublabel="...", score=0.5, color=COLORS["no_spike"])
+    # ── NO DATA — too few dots to classify (new expiry just started) ────────
+    if len(df) < 6:
+        n = len(df)
+        return dict(state="NO DATA", sublabel=f"only {n} dot{'s' if n != 1 else ''} — need ≥6", score=0.5, color="#888")
+
     prem = df["premium"].to_numpy()
     ema  = df["ema5"].to_numpy()
     cp, ce = float(prem[-1]), float(ema[-1])
-    win  = prem[-16:] if len(prem) >= 16 else prem
-    pv   = float(np.max(win))
-    pe   = (pv - float(np.mean(win))) / (float(np.mean(win)) + 1e-9) * 100
-    pfp  = (pv - cp) / (pv + 1e-9) * 100
-    es   = ((ce - ema[-4]) / ema[-4] * 100) if len(ema) >= 4 else 0.0
-    diffs = np.diff(prem[-9:])
-    cd, cu = 0, 0
-    for d in reversed(diffs):
-        if d < 0:
-            if cu > 0: break
-            cd += 1
-        elif d > 0:
-            if cd > 0: break
-            cu += 1
-        else:
-            break
-    if pe < T_SPIKE_MIN_EXPANSION:
-        return dict(state="NO SPIKE", sublabel=f"exp < {T_SPIKE_MIN_EXPANSION}%", score=0.5, color=COLORS["no_spike"])
-    if pfp > T_STALE_DROP_PCT:
-        return dict(state="STALE", sublabel=f"−{pfp:.0f}% drop", score=0.0, color=COLORS["stale"])
-    if cu >= T_CONSEC_UP_SPIKING and es > 0.0 and cp > ce:
-        return dict(state="SPIKING", sublabel=f"{cu}↑ consec · Prem>EMA", score=0.5, color=COLORS["spiking"])
-    if cd >= T_CONSEC_DOWN_CASE_A and es < T_EMA_SLOPE_CASE_A and cp < ce:
-        return dict(state="CASE A", sublabel=f"{cd}↓ drops · Prem<EMA", score=3.5, color=COLORS["case_a"])
-    if cd >= T_CONSEC_DOWN_ROLLING and es < T_EMA_SLOPE_ROLLING and cp < ce:
-        return dict(state="ROLLING", sublabel=f"{cd}↓ drops · Prem<EMA", score=2.5, color=COLORS["rolling"])
-    return dict(state="COOLING", sublabel="watch", score=1.0, color=COLORS["cooling"])
+
+    # Window of last 16 dots for spike / stale analysis
+    win_prem = prem[-16:] if len(prem) >= 16 else prem
+    win_ema  = ema[-16:]  if len(ema)  >= 16 else ema
+
+    # ── NO SPIKE — no dot in the last 16 had premium ≥ EMA + $1 ────────────
+    spike_indices = [
+        i for i, (p, e) in enumerate(zip(win_prem, win_ema))
+        if float(p) >= float(e) + 1.0
+    ]
+    if not spike_indices:
+        return dict(state="NO SPIKE", sublabel=f"no dot ≥ EMA+$1 in last {len(win_prem)}", score=0.5, color=COLORS["no_spike"])
+
+    # ── SPIKING — current dot still above EMA + $1 → wait for rollover ─────
+    if cp >= ce + 1.0:
+        return dict(state="SPIKING", sublabel="Prem > EMA+$1 · wait for rollover", score=0.5, color=COLORS["spiking"])
+
+    # ── STALE — most recent spike dot was ≥ 6 dots ago → window closed ──────
+    last_spike_idx    = spike_indices[-1]
+    dots_since_spike  = (len(win_prem) - 1) - last_spike_idx
+    if dots_since_spike >= 6:
+        return dict(state="STALE", sublabel=f"peak {dots_since_spike} dots ago · window closed", score=0.0, color=COLORS["stale"])
+
+    # ── Post-peak diffs — premium changes from the spike dot onward ─────────
+    # spike dot is at win_prem[last_spike_idx]; post-peak dots follow it
+    post_peak_prem = win_prem[last_spike_idx:]   # includes the spike dot itself
+    if len(post_peak_prem) < 2:
+        # Only the spike dot itself — no diffs yet
+        return dict(state="COOLING", sublabel="only 1 dot since peak — need ≥2", score=1.0, color=COLORS["cooling"])
+
+    post_diffs = np.diff(post_peak_prem).tolist()   # diffs after the spike dot
+    n_post     = len(post_diffs)                     # number of post-peak moves
+
+    # ── COOLING — fewer than 3 post-peak diffs → too early to judge ─────────
+    if n_post < 3:
+        diff_str = ", ".join(f"{d:+.2f}" for d in post_diffs)
+        return dict(
+            state="COOLING",
+            sublabel=f"only {n_post} dot{'s' if n_post != 1 else ''} since peak — need ≥3",
+            score=1.0,
+            color=COLORS["cooling"],
+        )
+
+    # ── CASE A — last 3-4 diffs all negative, EMA slope falling, Prem < EMA ─
+    last_diffs = post_diffs[-4:] if len(post_diffs) >= 4 else post_diffs[-3:]
+    es = ((ce - float(ema[-4])) / float(ema[-4]) * 100) if len(ema) >= 4 else 0.0
+    if all(d < 0 for d in last_diffs) and es < T_EMA_SLOPE_CASE_A and cp < ce:
+        diff_str = ", ".join(f"{d:+.2f}" for d in post_diffs[-4:])
+        return dict(
+            state="CASE A",
+            sublabel=f"post-peak diffs: {diff_str}",
+            score=3.5,
+            color=COLORS["case_a"],
+        )
+
+    # ── ROLLING — 2 of last 3 post-peak diffs are negative ──────────────────
+    last3 = post_diffs[-3:]
+    n_down = sum(1 for d in last3 if d < 0)
+    if n_down >= 2:
+        diff_str = ", ".join(f"{d:+.2f}" for d in post_diffs[-3:])
+        return dict(
+            state="ROLLING",
+            sublabel=f"post-peak diffs: {diff_str}",
+            score=2.5,
+            color=COLORS["rolling"],
+        )
+
+    # ── COOLING — spike ended but not enough downward pressure yet ───────────
+    diff_str = ", ".join(f"{d:+.2f}" for d in post_diffs[-3:])
+    return dict(
+        state="COOLING",
+        sublabel=f"only {n_post} dot(s) since peak — need ≥3",
+        score=1.0,
+        color=COLORS["cooling"],
+    )
 
 # ══════════════════════════════════════════
 # DATA FETCH
@@ -310,12 +376,152 @@ def fetch_expiry_data(exp_code: str, spot: float, tickers: list) -> dict | None:
         return None
 
 # ══════════════════════════════════════════
+# MARKET-WIDE IV / RV  (Delta CDN 5m)
+# ══════════════════════════════════════════
+def fetch_market_iv_rv() -> tuple[float | None, float | None]:
+    """
+    Fetch live market-wide ATM IV and RV from Delta CDN options_iv / options_rv.
+    Uses 5m resolution over the past 7 days and returns the latest non-null value.
+    Returns (rv, iv) both as annualised % floats, or (None, None) on failure.
+    This is the same method used in BTC_IV_RV_Monitor.py.
+    """
+    end_t   = int(time.time())
+    start_t = end_t - CDN_LIVE_DAYS * 24 * 3600
+
+    def _cdn(endpoint: str) -> str:
+        return (
+            f"{DELTA_CDN}/{endpoint}"
+            f"?start_time={start_t}&end_time={end_t}"
+            f"&asset_symbol={CDN_ASSET}&maturity={CDN_MATURITY}&resolution=5m"
+        )
+
+    rv = iv = None
+    try:
+        r = requests.get(_cdn("options_rv"), headers=CDN_HEADERS, timeout=10)
+        if r.status_code == 200:
+            vals = [x for x in r.json().get("result", {}).get("rv", []) if x is not None]
+            if vals:
+                rv = round(float(vals[-1]), 2)
+    except Exception:
+        pass
+    try:
+        r = requests.get(_cdn("options_iv"), headers=CDN_HEADERS, timeout=10)
+        if r.status_code == 200:
+            vals = [x for x in r.json().get("result", {}).get("atm_iv", []) if x is not None]
+            if vals:
+                iv = round(float(vals[-1]), 2)
+    except Exception:
+        pass
+    return rv, iv
+
+
+def fetch_delta_iv_history(days: int = IVP_LOOKBACK_DAYS) -> list[float]:
+    """
+    Fetch `days` of ATM IV history from Delta CDN on the SAME scale as the
+    live market IV (options_iv endpoint).  Used to calculate IVP.
+
+    Why not resolution=1D: Delta CDN silently returns [] for 1D — unusable.
+    Why not Deribit DVOL: DVOL runs 50-80; Delta CDN atm_iv runs 25-45 —
+      mixing them makes IVP = 0% because all history >> live IV.
+
+    Strategy: fetch 1h bars (same endpoint, same scale), downsample to one
+    value per UTC calendar day.  Fallback to 5m bars if 1h returns < 10.
+    """
+    end_t   = int(time.time())
+    start_t = end_t - days * 24 * 3600
+
+    def _downsample(iv_list: list, ts_list: list, stride: int) -> list[float]:
+        if ts_list and len(ts_list) == len(iv_list):
+            daily: dict = {}
+            for ts, iv in zip(ts_list, iv_list):
+                if iv is None or float(iv) <= 0:
+                    continue
+                key = datetime.utcfromtimestamp(int(ts)).strftime("%Y-%m-%d")
+                daily[key] = round(float(iv), 2)   # last value of day wins
+            return list(daily.values())
+        valid = [round(float(v), 2) for v in iv_list if v is not None and float(v) > 0]
+        return valid[::stride] if valid else []
+
+    for resolution, stride in [("1h", 24), ("5m", 288)]:
+        try:
+            url = (
+                f"{DELTA_CDN}/options_iv"
+                f"?start_time={start_t}&end_time={end_t}"
+                f"&asset_symbol={CDN_ASSET}&maturity={CDN_MATURITY}"
+                f"&resolution={resolution}"
+            )
+            r = requests.get(url, headers=CDN_HEADERS, timeout=20)
+            if r.status_code != 200:
+                continue
+            result  = r.json().get("result", {})
+            iv_list = result.get("atm_iv", [])
+            ts_list = result.get("time", [])
+            if len(iv_list) < 10:
+                continue
+            daily = _downsample(iv_list, ts_list, stride)
+            if len(daily) >= 10:
+                return daily
+        except Exception:
+            continue
+    return []
+
+
+def calculate_ivp(iv_history: list[float], current_iv: float | None) -> float | None:
+    """
+    IV Percentile: % of historical days where ATM IV < today's IV.
+    Returns 0-100 float, or None if history is too short (< 10 points).
+    """
+    if len(iv_history) < 10 or current_iv is None:
+        return None
+    return round(sum(1 for v in iv_history if v < current_iv) / len(iv_history) * 100, 1)
+
+
+def market_iv_rv_signal(iv: float | None, rv: float | None) -> dict:
+    """
+    Build the IV/RV card dict using market-wide CDN values (not per-expiry IV).
+    Returns keys: value, sublabel, color, score — same shape as score_iv_rv().
+    """
+    if iv is None or rv is None:
+        return {"score": 1.75, "value": "N/A", "sublabel": "no data", "color": "#888"}
+    spread = round(iv - rv, 2)
+    rel    = "IV>RV" if spread >= 0 else "IV<RV"
+    delta  = f"Δ {spread:+.1f}"
+    if spread > T_IV_RV_RICH:
+        return {"score": 3.5, "value": rel, "sublabel": f"RICH {delta}", "color": COLORS["case_a"]}
+    if spread >= 0:
+        return {"score": 2.5, "value": rel, "sublabel": f"FAIR {delta}", "color": COLORS["rolling"]}
+    return    {"score": 1.0, "value": rel, "sublabel": f"RISK {delta}", "color": COLORS["wait"]}
+
+
+def market_ivp_signal(ivp: float | None, iv: float | None) -> dict:
+    """
+    Build the IV Percentile card dict from IVP calculation.
+    Thresholds: CHEAP < 25%, FAIR 25-75%, RICH > 75%.
+    Returns keys: value, sublabel, color, score — same shape as score_iv_percentile().
+    """
+    if ivp is None:
+        lbl = "no data" if iv is None else "collecting..."
+        return {"score": 0.75, "value": "N/A", "sublabel": lbl, "color": "#888"}
+    if ivp < IVP_CHEAP:
+        return {"score": 0.50, "value": f"{ivp:.0f}%", "sublabel": "CHEAP", "color": COLORS["case_a"]}
+    if ivp > IVP_RICH:
+        return {"score": 1.50, "value": f"{ivp:.0f}%", "sublabel": "RICH",  "color": COLORS["wait"]}
+    return     {"score": 1.00, "value": f"{ivp:.0f}%", "sublabel": "FAIR",  "color": COLORS["rolling"]}
+
+
+# ══════════════════════════════════════════
 # ONE-SHOT FULL REFRESH (called by app.py)
 # ══════════════════════════════════════════
 def full_refresh() -> dict:
     """
     Fetch everything needed for one dashboard render.
     Returns a dict keyed by expiry code with all scores + dataframe.
+
+    IV/RV card  — uses market-wide Delta CDN options_iv / options_rv (5m live).
+                  Same source and scale as BTC_IV_RV_Monitor.py.
+    IV Pct card — uses 90-day Delta CDN options_iv history (1h→daily downsample)
+                  compared against the same live market IV.  Guarantees apples-
+                  to-apples percentile (no Deribit DVOL scale mismatch).
     """
     spot, tics = fetch_spot_and_tickers()
     if spot <= 0:
@@ -325,9 +531,16 @@ def full_refresh() -> dict:
     if not expiries:
         return {"error": "No BTC option expiries found. Market may be closed."}
 
-    rv_30d   = compute_30d_rv()
-    results  = {}
+    rv_30d = compute_30d_rv()
 
+    # ── Market-wide IV/RV + IVP (fetched once, shared across all expiry rows) ─
+    mkt_rv, mkt_iv   = fetch_market_iv_rv()
+    iv_history        = fetch_delta_iv_history(IVP_LOOKBACK_DAYS)
+    ivp_value         = calculate_ivp(iv_history, mkt_iv)
+    mkt_iv_rv_card    = market_iv_rv_signal(mkt_iv, mkt_rv)
+    mkt_ivp_card      = market_ivp_signal(ivp_value, mkt_iv)
+
+    results = {}
     for exp in expiries:
         ensure_state(exp)
         data = fetch_expiry_data(exp, spot, tics)
@@ -337,30 +550,37 @@ def full_refresh() -> dict:
         iv = data["iv"]
         cp = df["premium"].iloc[-1]
 
-        st              = classify_premium_state(df)
-        s2, v2, sub2, c2 = score_iv_rv(iv, rv_30d)
+        st_             = classify_premium_state(df)
         s3, v3, sub3, c3 = score_ratio(cp, data["spot"])
-        s4, v4, sub4, c4 = score_iv_percentile(iv, exp)
-        total_score      = st["score"] + s2 + s3 + s4
+
+        # IV/RV and IVP come from market-wide CDN data — not per-expiry option IV
+        total_score = st_["score"] + mkt_iv_rv_card["score"] + s3 + mkt_ivp_card["score"]
 
         results[exp] = {
             "label":       expiry_label(exp),
             "df":          df,
             "spot":        data["spot"],
             "atm":         data["atm"],
-            "iv":          iv,
+            "iv":          iv,          # per-expiry ATM IV (for chart title)
+            "mkt_iv":      mkt_iv,      # market-wide CDN IV
+            "mkt_rv":      mkt_rv,      # market-wide CDN RV
+            "ivp":         ivp_value,   # 90-day percentile
             "rv":          rv_30d,
             "total_score": total_score,
-            "state":       st,
-            "iv_rv":       {"score": s2, "value": v2, "sublabel": sub2, "color": c2},
+            "state":       st_,
+            "iv_rv":       mkt_iv_rv_card,   # ← market-wide, correct IV>RV / IV<RV
             "ratio":       {"score": s3, "value": v3, "sublabel": sub3, "color": c3},
-            "iv_pct":      {"score": s4, "value": v4, "sublabel": sub4, "color": c4},
+            "iv_pct":      mkt_ivp_card,     # ← 90-day IVP on same scale as live IV
         }
 
     results["__meta__"] = {
-        "spot":      spot,
-        "rv_30d":    rv_30d,
-        "expiries":  expiries,
-        "refreshed": datetime.now(IST).strftime("%H:%M:%S IST"),
+        "spot":       spot,
+        "rv_30d":     rv_30d,
+        "mkt_iv":     mkt_iv,
+        "mkt_rv":     mkt_rv,
+        "ivp":        ivp_value,
+        "iv_history_days": len(iv_history),
+        "expiries":   expiries,
+        "refreshed":  datetime.now(IST).strftime("%H:%M:%S IST"),
     }
     return results
