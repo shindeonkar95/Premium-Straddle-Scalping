@@ -354,7 +354,9 @@ def fetch_expiry_data(exp_code: str, spot: float, tickers: list) -> dict | None:
 
         df = pd.DataFrame(rows).sort_values("time").reset_index(drop=True)
         if df.empty: return None
-        df["premium"]     = df["premium"].rolling(window=2).mean().fillna(df["premium"])
+        # NOTE: rolling(2) mean was removed — it caused systematic upward bias
+        # (in a declining premium series each bar averaged with the prior higher bar)
+        # Raw call+put sum is used directly, matching TradeSteady's approach.
         df["ema5"]        = df["premium"].ewm(span=EMA_SPAN, adjust=False).mean()
         df["datetime"]    = (
             pd.to_datetime(df["time"], unit="s")
