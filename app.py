@@ -10,7 +10,6 @@ import matplotlib
 matplotlib.use("Agg")          # headless backend — no Tk needed on Streamlit Cloud
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
-import matplotlib.dates as mdates
 from matplotlib.patches import FancyBboxPatch
 import pandas as pd
 
@@ -21,14 +20,13 @@ from core import (
     expiry_label,
     IVP_CHEAP,
     IVP_RICH,
-    IST,
 )
 
 # ══════════════════════════════════════════
 # PAGE CONFIG
 # ══════════════════════════════════════════
 st.set_page_config(
-    page_title="BTC Straddle Scanner",
+    page_title="Premium Straddle Scalping",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -61,7 +59,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-REFRESH_SECONDS = 300   # 5-minute refresh — matches original REFRESH_INTERVAL_MS
+REFRESH_SECONDS = 180   # 3-minute refresh
 _CARD_NUMS = ["①", "②", "③", "④"]
 
 # ══════════════════════════════════════════
@@ -101,7 +99,6 @@ def build_chart(exp_code: str, result: dict) -> plt.Figure:
 
     ax.yaxis.tick_right()
     ax.yaxis.set_label_position("right")
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=IST))
     ax.tick_params(colors="#888", labelsize=8)
     for sp in ax.spines.values():
         sp.set_color("#252e3b")
@@ -180,7 +177,7 @@ with st.sidebar:
 # ══════════════════════════════════════════
 # HEADER
 # ══════════════════════════════════════════
-st.markdown("## 📊 BTC Premium Straddle Scanner")
+st.markdown("## 📊 Premium Straddle Scalping")
 st.caption("Live data · Delta Exchange India · Auto-rolls to new expiries")
 
 status_bar = st.empty()
