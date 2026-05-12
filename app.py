@@ -10,6 +10,7 @@ import matplotlib
 matplotlib.use("Agg")          # headless backend — no Tk needed on Streamlit Cloud
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+import matplotlib.dates as mdates
 from matplotlib.patches import FancyBboxPatch
 import pandas as pd
 
@@ -20,6 +21,7 @@ from core import (
     expiry_label,
     IVP_CHEAP,
     IVP_RICH,
+    IST,
 )
 
 # ══════════════════════════════════════════
@@ -99,6 +101,7 @@ def build_chart(exp_code: str, result: dict) -> plt.Figure:
 
     ax.yaxis.tick_right()
     ax.yaxis.set_label_position("right")
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=IST))
     ax.tick_params(colors="#888", labelsize=8)
     for sp in ax.spines.values():
         sp.set_color("#252e3b")
